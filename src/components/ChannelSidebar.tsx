@@ -17,7 +17,8 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
   onToggleCollapse
 }) => {
   const [channels, setChannels] = useState<Channel[]>([]);
-  const [selectedCategory, setSelectedCategory] = useState<Category | 'all'>('all');
+  // Default to "Cignal" and remove the "All" option
+  const [selectedCategory, setSelectedCategory] = useState<Category>('Cignal');
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
 
@@ -46,19 +47,19 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
 
   // Filter channels
   const filteredChannels = channels.filter(channel => {
-    const matchesCategory = selectedCategory === 'all' || channel.category === selectedCategory;
+    const matchesCategory = channel.category === selectedCategory;
     const matchesSearch = channel.name.toLowerCase().includes(searchQuery.toLowerCase());
     return matchesCategory && matchesSearch;
   });
 
-  // Group channels by category
-  const groupedChannels = filteredChannels.reduce((acc, channel) => {
-    if (!acc[channel.category]) {
-      acc[channel.category] = [];
-    }
-    acc[channel.category].push(channel);
-    return acc;
-  }, {} as Record<string, Channel[]>);
+  // Also prepare groupedChannels for when you want to display other categories in grouped view
+  const groupedChannels = channels
+    .filter(ch => ch.name.toLowerCase().includes(searchQuery.toLowerCase()))
+    .reduce((acc, channel) => {
+      if (!acc[channel.category]) acc[channel.category] = [];
+      acc[channel.category].push(channel);
+      return acc;
+    }, {} as Record<string, Channel[]>);
 
   return (
     <>
@@ -69,6 +70,7 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
           isCollapsed ? 'right-0' : 'right-80 md:right-96'
         }`}
         style={{ boxShadow: '0 0 15px rgba(0,0,0,0.5)' }}
+        type="button"
       >
         {isCollapsed ? <ChevronLeft className="w-5 h-5" /> : <ChevronRight className="w-5 h-5" />}
       </button>
@@ -112,19 +114,8 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
             />
           </div>
 
-          {/* Category Pills */}
+          {/* Category Pills (removed 'All', default is Cignal) */}
           <div className="flex flex-wrap gap-2">
-            <button
-              onClick={() => setSelectedCategory('all')}
-              className={`px-3 py-1.5 rounded-full text-xs font-medium transition-all transform hover:scale-105 ${
-                selectedCategory === 'all'
-                  ? 'bg-gradient-to-r from-amber-500 to-yellow-600 text-white shadow-lg'
-                  : 'bg-amber-900/50 text-amber-300 hover:bg-amber-800/50'
-              }`}
-              style={selectedCategory === 'all' ? { boxShadow: '0 0 15px rgba(251, 191, 36, 0.5)' } : {}}
-            >
-              All
-            </button>
             {CATEGORIES.map((category) => (
               <button
                 key={category}
@@ -135,6 +126,7 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
                     : 'bg-amber-900/50 text-amber-300 hover:bg-amber-800/50'
                 }`}
                 style={selectedCategory === category ? { boxShadow: '0 0 15px rgba(251, 191, 36, 0.3)' } : {}}
+                type="button"
               >
                 {category}
               </button>
@@ -163,14 +155,27 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
             </div>
           ) : filteredChannels.length === 0 ? (
             <div className="text-center py-8 text-amber-600">
-              No channels found
+              No channels found for {selectedCategory}
             </div>
           ) : (
             <div className="p-2">
-              {selectedCategory === 'all' ? (
-                // Grouped view
-                Object.entries(groupedChannels).map(([category, categoryChannels]) => (
-                  <div key={category} className="mb-4">
+              {/* Flat view for the selected single category (Cignal by default) */}
+              <div className="space-y-1">
+                {filteredChannels.map((channel) => (
+                  <ChannelItem
+                    key={channel.id}
+                    channel={channel}
+                    isSelected={selectedChannel?.id === channel.id}
+                    onSelect={onChannelSelect}
+                  />
+                ))}
+              </div>
+
+              {/* Optionally, show other categories as grouped lists below the focused category */}
+              {Object.entries(groupedChannels)
+                .filter(([cat]) => cat !== selectedCategory)
+                .map(([category, categoryChannels]) => (
+                  <div key={category} className="mt-6">
                     <h3 
                       className={`px-3 py-2 text-sm font-bold rounded-lg mb-2 ${CATEGORY_GEMS[category as Category]}`}
                       style={{ boxShadow: '0 0 10px rgba(0,0,0,0.3)' }}
@@ -189,19 +194,7 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
                     </div>
                   </div>
                 ))
-              ) : (
-                // Flat view for single category
-                <div className="space-y-1">
-                  {filteredChannels.map((channel) => (
-                    <ChannelItem
-                      key={channel.id}
-                      channel={channel}
-                      isSelected={selectedChannel?.id === channel.id}
-                      onSelect={onChannelSelect}
-                    />
-                  ))}
-                </div>
-              )}
+              }
             </div>
           )}
         </div>
@@ -212,7 +205,7 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
           style={{ background: 'linear-gradient(0deg, #1a0f0a 0%, transparent 100%)' }}
         >
           <p className="text-amber-600 text-xs">
-            {filteredChannels.length} channels available
+            {filteredChannels.length} channels in {selectedCategory}
           </p>
         </div>
       </div>
@@ -238,6 +231,7 @@ const ChannelItem: React.FC<{
           : 'bg-amber-950/30 hover:bg-amber-900/50'
       }`}
       style={isSelected ? { boxShadow: '0 0 15px rgba(251, 191, 36, 0.3)' } : {}}
+      type="button"
     >
       {/* Thumbnail */}
       <div 
