@@ -1,913 +1,621 @@
-// src/components/VideoPlayer.tsx
-import React, { useCallback, useEffect, useRef, useState } from "react";
-import { supabase } from "@/lib/supabase";
-import { Channel } from "@/types";
-
-/**
- * Merged VideoPlayer:
- * - UI from your newer VideoPlayer file
- * - Robust playback logic from the older working implementation
- * - HLS.js / Shaka / JW integration
- * - Proxy handling for hosts like moveonjoy
- * - Signed URL renewal via Supabase Edge Function "get-stream"
- * - Resume position saving
- */
-
-interface JwOptions {
-  useJw?: boolean;
-  jwKey?: string;
-  makeLicenseProxy?: (url: string) => string | null;
-  makeProxyUrl?: (url: string) => string;
-  drm?: { widevine?: string | null; playready?: string | null };
-}
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, SkipBack, SkipForward } from 'lucide-react';
+import { Channel } from '@/types';
 
 interface VideoPlayerProps {
   channel: Channel | null;
-  onClose?: () => void;
-  epgData?: Channel[] | null;
-  jwOptions?: JwOptions;
+  onChannelChange?: (direction: 'prev' | 'next') => void;
 }
 
-const BACKUP_PROXY = "https://poohlover.serv00.net";
-const FORCE_PROXY_HOSTS = [
-  "fl1.moveonjoy.com",
-  "linear-1147.frequency.stream",
-  "origin.thetvapp.to",
-];
+/**
+ * Minimal, focused VideoPlayer
+ * - Keeps your UI/controls intact
+ * - Playback logic for m3u8 (HLS), mpd (DASH), mp4/direct
+ * - Proxy fallback (backup proxy) on fatal network/CORS errors
+ * - Loads Hls.js / Shaka dynamically when needed
+ *
+ * Note: This intentionally removes JW, signed URL logic, resume, polling, etc.
+ */
 
-const withBackupProxy = (url: string) =>
-  url.startsWith(BACKUP_PROXY) ? url : `${BACKUP_PROXY}/${url}`;
+/* ----- Proxy helpers ----- */
+const BACKUP_PROXY = 'https://poohlover.serv00.net';
+const FORCE_PROXY_HOSTS = ['fl1.moveonjoy.com', 'moveonjoy.com', 'linear-1147.frequency.stream'];
+
+const withBackupProxy = (url: string) => (url.startsWith(BACKUP_PROXY) ? url : `${BACKUP_PROXY}/${url}`);
 
 const mustProxy = (url: string) => {
   try {
-    return FORCE_PROXY_HOSTS.includes(new URL(url).host) || /moveonjoy/i.test(url);
+    const host = new URL(url).host;
+    return FORCE_PROXY_HOSTS.some(h => host.includes(h)) || /moveonjoy/i.test(host);
   } catch {
     return false;
   }
 };
 
-const isLowEndDevice = () => {
-  const cores = navigator.hardwareConcurrency || 2;
-  // @ts-ignore
-  const memory = (navigator as any).deviceMemory || 2;
-  return cores <= 4 || memory <= 2;
+/* ----- Loading spinner + static noise (kept from your UI) ----- */
+const LoadingSpinner: React.FC = () => (
+  <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-20">
+    <div className="flex gap-1 mb-4">
+      {'LOADING'.split('').map((letter, i) => (
+        <span
+          key={i}
+          className="text-2xl md:text-4xl font-bold text-amber-400 animate-bounce"
+          style={{
+            animationDelay: `${i * 0.1}s`,
+            textShadow: '0 0 10px rgba(251, 191, 36, 0.8), 0 0 20px rgba(251, 191, 36, 0.5)'
+          }}
+        >
+          {letter}
+        </span>
+      ))}
+    </div>
+    <p className="text-amber-200/60 text-sm animate-pulse">please wait...</p>
+  </div>
+);
+
+const StaticNoise: React.FC = () => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    let raf = 0;
+    const draw = () => {
+      const w = canvas.width = canvas.clientWidth;
+      const h = canvas.height = canvas.clientHeight;
+      const imageData = ctx.createImageData(w, h);
+      const d = imageData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const v = Math.floor(Math.random() * 255);
+        d[i] = d[i + 1] = d[i + 2] = v;
+        d[i + 3] = 255;
+      }
+      ctx.putImageData(imageData, 0, 0);
+      raf = requestAnimationFrame(draw);
+    };
+    draw();
+    return () => cancelAnimationFrame(raf);
+  }, []);
+  return (
+    <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900">
+      <canvas ref={canvasRef} className="w-full h-full object-cover opacity-30" />
+      <div className="absolute inset-0 flex flex-col items-center justify-center">
+        <p className="text-white/60 text-lg font-medium mb-2">No Signal</p>
+        <p className="text-white/40 text-sm">Select a channel to start watching</p>
+      </div>
+    </div>
+  );
 };
 
-const RESUME_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
-const RESUME_KEY_PREFIX = "ptv:resume:";
-
-function saveResumePosition(channelId: string, position: number) {
-  try {
-    const payload = { pos: position, ts: Date.now() };
-    localStorage.setItem(`${RESUME_KEY_PREFIX}${channelId}`, JSON.stringify(payload));
-  } catch {}
-}
-function loadResumePosition(channelId: string): number | null {
-  try {
-    const raw = localStorage.getItem(`${RESUME_KEY_PREFIX}${channelId}`);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed.pos !== "number" || typeof parsed.ts !== "number") return null;
-    if (Date.now() - parsed.ts > RESUME_TTL) {
-      localStorage.removeItem(`${RESUME_KEY_PREFIX}${channelId}`);
-      return null;
-    }
-    return parsed.pos;
-  } catch {
-    return null;
-  }
-}
-
-async function detectLlHls(url: string, makeProxy?: (u: string) => string | null) {
-  try {
-    const probe = makeProxy ? (makeProxy(url) ?? url) : url;
-    const r = await fetch(probe, { cache: "no-store" });
-    if (!r.ok) return false;
-    const text = await r.text();
-    if (text.includes("#EXT-X-PART") || text.includes("#EXT-X-SERVER-CONTROL")) return true;
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-/* Expose library types on window for runtime checks */
-declare global {
-  interface Window {
-    Hls?: any;
-    shaka?: any;
-    jwplayer?: any;
-  }
-}
-
-const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onClose, jwOptions }) => {
+/* ----- VideoPlayer component ----- */
+const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const jwContainerRef = useRef<HTMLDivElement | null>(null);
-
   const hlsRef = useRef<any | null>(null);
   const shakaRef = useRef<any | null>(null);
-  const jwRef = useRef<any | null>(null);
-
-  const sessionIdRef = useRef<string>(() => {
-    try {
-      return crypto.randomUUID();
-    } catch {
-      return Math.random().toString(36).slice(2);
-    }
-  }) as React.MutableRefObject<string>;
-
-  const streamCacheRef = useRef<Map<string, any>>(new Map());
-  const streamExpiryRef = useRef<number | null>(null);
-
-  const manifestPollIntervalRef = useRef<number | null>(null);
-  const jwManifestDetachRef = useRef<(() => void) | null>(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
-  const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
+  const [volume, setVolume] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [showControls, setShowControls] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(Number.NaN);
+  const [duration, setDuration] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [controlsVisible, setControlsVisible] = useState(true);
+  const [quality, setQuality] = useState<string>('auto');
+  const [showSettings, setShowSettings] = useState(false);
+  const [availableQualities, setAvailableQualities] = useState<string[]>(['auto']);
 
-  const controlsTimerRef = useRef<number | null>(null);
+  const controlsTimeoutRef = useRef<number | null>(null);
 
-  const isDesktopViewInit = (() => {
-    if (typeof window === "undefined") return false;
-    const wide = window.innerWidth >= 1024;
-    const pointerFine = window.matchMedia && window.matchMedia("(pointer: fine)").matches;
-    const isTouch = ("ontouchstart" in window) || (navigator.maxTouchPoints > 0);
-    return wide && pointerFine && !isTouch;
-  })();
-  const [isDesktopView, setIsDesktopView] = useState<boolean>(isDesktopViewInit);
+  /* Dynamically load Hls.js and Shaka when component mounts */
+  useEffect(() => {
+    const inserted: HTMLScriptElement[] = [];
+    const addScript = (src: string) =>
+      new Promise<void>((resolve, reject) => {
+        if (document.querySelector(`script[src="${src}"]`)) return resolve();
+        const s = document.createElement('script');
+        s.src = src;
+        s.async = true;
+        s.onload = () => resolve();
+        s.onerror = (e) => reject(e);
+        document.head.appendChild(s);
+        inserted.push(s);
+      });
 
-  /* helpers */
+    let canceled = false;
+    (async () => {
+      try {
+        if (!(window as any).Hls) {
+          await addScript('https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.7/hls.min.js');
+        }
+        if (!(window as any).shaka) {
+          await addScript('https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.7.11/shaka-player.compiled.min.js');
+        }
+      } catch (err) {
+        // non-fatal: playback fallbacks will be used
+        console.warn('Error loading playback libs:', err);
+      } finally {
+        if (canceled) {
+          // remove scripts if unmounted quickly
+          inserted.forEach(s => s.remove());
+        }
+      }
+    })();
+
+    return () => {
+      canceled = true;
+    };
+  }, []);
+
+  /* Helper: decode base64 if stream_url is stored encoded, otherwise return as-is */
   const getStreamUrl = useCallback((ch: Channel) => {
     try {
+      // if the stream_url is base64 encoded, decode, otherwise return raw
       return atob(ch.stream_url);
     } catch {
       return ch.stream_url;
     }
   }, []);
 
-  const loadScript = (src: string) =>
-    new Promise<void>((resolve, reject) => {
-      if (document.querySelector(`script[src="${src}"]`)) {
-        resolve();
-        return;
+  /* Cleanup function to destroy hls/shaka and clear video */
+  const cleanup = useCallback(() => {
+    try {
+      if (hlsRef.current) {
+        try { hlsRef.current.destroy(); } catch {}
+        hlsRef.current = null;
       }
-      const s = document.createElement("script");
-      s.src = src;
-      s.async = true;
-      s.onload = () => resolve();
-      s.onerror = (e) => reject(e);
-      document.head.appendChild(s);
-    });
-
-  const showControlsTemporarily = (ms = 2500) => {
-    setControlsVisible(true);
-    if (controlsTimerRef.current) {
-      window.clearTimeout(controlsTimerRef.current);
-      controlsTimerRef.current = null;
-    }
-    controlsTimerRef.current = window.setTimeout(() => setControlsVisible(false), ms) as unknown as number;
-  };
-
-  const makeProxyUrl = (src: string) => {
-    if (jwOptions?.makeProxyUrl) return jwOptions.makeProxyUrl(src);
-    return withBackupProxy(src);
-  };
-
-  const makeLicenseProxy = (lic?: string) => {
-    if (!lic) return lic || undefined;
-    if (jwOptions?.makeLicenseProxy) return jwOptions.makeLicenseProxy(lic) ?? lic;
-    return `${BACKUP_PROXY}/license-proxy.php?url=${encodeURIComponent(lic)}`;
-  };
-
-  const attachManifestPoll = (masterUrl: string, cb: (fresh: string) => void, intervalSec = 8) => {
-    try { if (manifestPollIntervalRef.current) { clearInterval(manifestPollIntervalRef.current); manifestPollIntervalRef.current = null; } } catch {}
-    const id = window.setInterval(async () => {
+    } catch {}
+    try {
+      if (shakaRef.current) {
+        try { shakaRef.current.destroy(); } catch {}
+        shakaRef.current = null;
+      }
+    } catch {}
+    if (videoRef.current) {
       try {
-        const probeUrl = jwOptions?.makeProxyUrl ? jwOptions.makeProxyUrl(masterUrl) : masterUrl;
-        const r = await fetch(probeUrl, { cache: "no-store" });
-        if (!r.ok) return;
-        const txt = await r.text();
-        const m = txt.match(/https?:\/\/[^"' ]+\.m3u8[^"' ]*/i);
-        if (m?.[0]) cb(m[0]);
+        videoRef.current.pause();
+        videoRef.current.removeAttribute('src');
+        videoRef.current.load();
       } catch {}
-    }, Math.max(4, intervalSec) * 1000);
-    manifestPollIntervalRef.current = id as unknown as number;
-    return () => {
-      try { if (manifestPollIntervalRef.current) { clearInterval(manifestPollIntervalRef.current); manifestPollIntervalRef.current = null; } } catch {}
-    };
-  };
-
-  useEffect(() => {
-    const onResizeOrPointer = () => {
-      const isTouch = (("ontouchstart" in window) || (navigator.maxTouchPoints > 0));
-      const wide = window.innerWidth >= 1024;
-      const pointerFine = window.matchMedia && window.matchMedia("(pointer: fine)").matches;
-      setIsDesktopView(wide && pointerFine && !isTouch);
-    };
-    window.addEventListener("resize", onResizeOrPointer);
-    if (window.matchMedia) {
-      const mq = window.matchMedia("(pointer: fine)");
-      const listener = (e: MediaQueryListEvent) => onResizeOrPointer();
-      try { mq.addEventListener("change", listener); } catch { try { (mq as any).addListener(listener); } catch {} }
     }
-    return () => {
-      window.removeEventListener("resize", onResizeOrPointer);
-      if (window.matchMedia) {
-        const mq = window.matchMedia("(pointer: fine)");
-        try { mq.removeEventListener("change", onResizeOrPointer); } catch { try { (mq as any).removeListener(onResizeOrPointer); } catch {} }
-      }
-    };
+    setAvailableQualities(['auto']);
+    setError(null);
   }, []);
 
+  /* Core: load channel stream with proxy fallback */
   useEffect(() => {
     if (!channel || !videoRef.current) {
-      setIsLoading(false);
+      cleanup();
       return;
     }
 
-    const v = videoRef.current;
     let cancelled = false;
-    let localHlsPollDetach: (() => void) | null = null;
+    let triedProxy = false;
 
-    setIsLoading(true);
-    setError(null);
+    const tryProxy = (url: string) => {
+      triedProxy = true;
+      return withBackupProxy(url);
+    };
 
-    const init = async () => {
-      try {
-        let streamUrl = getStreamUrl(channel);
+    const attachHls = async (url: string) => {
+      const HlsLib = (window as any).Hls;
+      if (!HlsLib || !HlsLib.isSupported()) {
+        // fallback to native
+        videoRef.current!.src = url;
+        await videoRef.current!.play().catch(() => {});
+        return;
+      }
 
-        // Signed stream via Edge Function (if any)
-        try {
-          const { data: { user } } = await supabase.auth.getUser();
-          const cached = streamCacheRef.current.get(channel.id);
-          if (cached && cached.expiresAt > Date.now()) {
-            streamUrl = cached.url;
-            streamExpiryRef.current = cached.expiresAt ?? null;
-          } else {
-            try {
-              const { data } = await supabase.functions.invoke("get-stream", {
-                body: { url: streamUrl, userId: user?.id ?? null, sessionId: sessionIdRef.current },
-              } as any);
-              if (data?.url) {
-                streamUrl = data.url;
-                streamExpiryRef.current = data.expiresAt ?? null;
-                streamCacheRef.current.set(channel.id, data);
-              }
-            } catch {}
-          }
-        } catch {}
+      const hls = new HlsLib({
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        maxBufferSize: 60 * 1000 * 1000,
+        maxBufferHole: 0.5,
+        lowLatencyMode: false,
+        startLevel: -1,
+      });
 
-        if (cancelled) return;
+      hlsRef.current = hls;
+      hls.loadSource(url);
+      hls.attachMedia(videoRef.current!);
 
-        // JW Player (optional)
-        if (jwOptions?.useJw && jwContainerRef.current) {
+      hls.on(HlsLib.Events.MANIFEST_PARSED, (_: any, data: any) => {
+        const qs = (data?.levels || []).map((l: any) => `${l.height || l.bitrate}p`);
+        setAvailableQualities(['auto', ...Array.from(new Set(qs))]);
+        videoRef.current!.play().catch(() => {});
+      });
+
+      hls.on(HlsLib.Events.ERROR, (_: any, ev: any) => {
+        console.warn('HLS error', ev);
+        if (!ev || !ev.fatal) return;
+        // On fatal error: try proxy once then error out
+        if (!triedProxy) {
+          const prox = tryProxy(url);
           try {
-            if (!(window as any).jwplayer) {
-              await loadScript("https://ssl.p.jwpcdn.com/player/v/8.38.10/jwplayer.js");
-            }
-            if (jwOptions.jwKey) (window as any).jwplayer.key = jwOptions.jwKey;
-
-            jwContainerRef.current.style.display = "block";
-            const fastUrl = await (async () => {
-              try {
-                const direct = await fetch(streamUrl, { method: "GET", cache: "no-store" });
-                if (direct.ok) return streamUrl;
-                return makeProxyUrl(streamUrl);
-              } catch {
-                return makeProxyUrl(streamUrl);
-              }
-            })();
-
-            const jwCfg: any = {
-              file: fastUrl,
-              autostart: true,
-              mute: false,
-              preload: "auto",
-              width: "100%",
-              height: "100%",
-              stretching: "uniform",
-              abouttext: "VideoPlayer",
-              sources: [{ file: fastUrl }],
-              hlsjsConfig: { lowLatencyMode: true, maxBufferLength: 45 },
-            };
-
-            const jwDrm: any = {};
-            if (jwOptions.drm?.widevine) jwDrm.widevine = { url: makeLicenseProxy(jwOptions.drm.widevine) || jwOptions.drm.widevine };
-            if (jwOptions.drm?.playready) jwDrm.playready = { url: makeLicenseProxy(jwOptions.drm.playready) || jwOptions.drm.playready };
-            if (Object.keys(jwDrm).length) jwCfg.drm = jwDrm;
-
-            try {
-              jwRef.current = (window as any).jwplayer(jwContainerRef.current).setup(jwCfg);
-            } catch {
-              jwRef.current = (window as any).jwplayer(jwContainerRef.current);
-              jwRef.current.setup && jwRef.current.setup(jwCfg);
-            }
-
-            jwRef.current?.on?.("ready", () => {
-              try { v.pause(); v.removeAttribute("src"); v.load(); } catch {}
-              try {
-                const resume = loadResumePosition(channel.id);
-                if (resume && jwRef.current?.seek) {
-                  try { jwRef.current.seek(resume); } catch {}
-                }
-              } catch {}
-              setIsLoading(false);
-            });
-
-            jwRef.current?.on?.("play", () => setIsPlaying(true));
-            jwRef.current?.on?.("pause", () => setIsPlaying(false));
-
-            jwRef.current?.on?.("error", async (err: any) => {
-              console.warn("JW error", err);
-              // Try proxy on JW error
-              try {
-                const prox = jwOptions?.makeProxyUrl ? jwOptions.makeProxyUrl(streamUrl) ?? makeProxyUrl(streamUrl) : makeProxyUrl(streamUrl);
-                jwRef.current?.load?.([{ file: prox }]);
-                return;
-              } catch {}
-              setError("JW Player error");
-            });
-
-            try {
-              const jwManifestDetach = attachManifestPoll(streamUrl, (fresh) => {
-                try {
-                  const final = jwOptions?.makeProxyUrl ? jwOptions.makeProxyUrl(fresh) ?? fresh : fresh;
-                  jwRef.current && jwRef.current.load && jwRef.current.load([{ file: final }]);
-                } catch {}
-              }, 8);
-              jwManifestDetachRef.current = jwManifestDetach;
-            } catch {}
-
-            return; // JW handles playback
-          } catch (jwErr) {
-            console.warn("JW init failed, falling back to native/HLS/Shaka", jwErr);
-            try { if (jwContainerRef.current) jwContainerRef.current.style.display = "none"; } catch {}
-          }
-        }
-
-        // DASH (MPD)
-        if (channel.stream_type === "mpd") {
-          if (!(window as any).shaka) {
-            await loadScript("https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.7.11/shaka-player.compiled.min.js");
-          }
-          const shaka = (window as any).shaka;
-          shaka.polyfill.installAll();
-          if (!shaka.Player.isBrowserSupported()) throw new Error("Browser not supported for DASH");
-          const player = new shaka.Player(v);
-          shakaRef.current = player;
-          player.configure({
-            streaming: { rebufferingGoal: 1.6, bufferingGoal: 15, bufferBehind: 30, lowLatencyMode: true },
-            abr: { enabled: true, defaultBandwidthEstimate: 600_000 },
-            manifest: { dash: { ignoreMinBufferTime: true } },
-          });
-          if (channel.drm_type === "clearkey" && channel.drm_kid && channel.drm_key) {
-            player.configure({ drm: { clearKeys: { [channel.drm_kid]: channel.drm_key } } });
-          }
-          try { await player.load(streamUrl); } catch { await player.load(withBackupProxy(streamUrl)); }
-          try {
-            const resume = loadResumePosition(channel.id);
-            if (resume != null) v.currentTime = resume;
+            hls.destroy();
           } catch {}
-          await v.play();
+          hlsRef.current = null;
+          attachHls(prox).catch(() => {
+            setError('Stream error occurred (HLS).');
+          });
+          return;
         }
-        // HLS (m3u8)
-        else if (channel.stream_type === "m3u8") {
-          const forceHlsJs = mustProxy(streamUrl) || /moveonjoy/i.test(streamUrl);
-          if (!forceHlsJs && v.canPlayType("application/vnd.apple.mpegurl")) {
-            const resume = loadResumePosition(channel.id);
-            v.src = streamUrl;
-            if (resume != null) v.currentTime = resume;
-            await v.play();
-          } else {
-            if (!(window as any).Hls) {
-              await loadScript("https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.7/hls.min.js");
-            }
-            const HlsLib = (window as any).Hls;
-            if (!HlsLib || !HlsLib.isSupported()) {
-              // fallback to direct
-              const resume = loadResumePosition(channel.id);
-              v.src = streamUrl;
-              if (resume != null) v.currentTime = resume;
-              await v.play();
-            } else {
-              const lowEnd = isLowEndDevice();
-              const supportsLl = await detectLlHls(streamUrl, jwOptions?.makeProxyUrl);
-              const llMode = supportsLl && !lowEnd;
+        setError('Stream error occurred (HLS).');
+      });
+    };
 
-              const hls = new HlsLib({
-                enableWorker: !lowEnd,
-                lowLatencyMode: llMode,
-                autoStartLoad: true,
-                startLevel: -1,
-                rebufferingGoal: lowEnd ? 2.0 : 1.6,
-                startFragPrefetch: !lowEnd,
-                initialLiveManifestSize: lowEnd ? 3 : 1,
-                maxBufferLength: lowEnd ? 40 : 24,
-                backBufferLength: 30,
-                maxBufferHole: 0.5,
-                maxBufferSize: lowEnd ? 60 * 1000 * 1000 : 90 * 1000 * 1000,
-                liveSyncDuration: llMode ? 1.5 : (lowEnd ? 6 : 3.2),
-                liveMaxLatencyDuration: llMode ? 6 : (lowEnd ? 12 : 6.5),
-                fragLoadingTimeOut: 20000,
-                fragLoadingMaxRetry: 8,
-              });
-
-              hlsRef.current = hls;
-              let triedBackup = false;
-
-              try {
-                localHlsPollDetach = attachManifestPoll(streamUrl, (fresh) => {
-                  try {
-                    const final = jwOptions?.makeProxyUrl ? jwOptions.makeProxyUrl(fresh) ?? fresh : fresh;
-                    try { hls.stopLoad(); } catch {}
-                    try { hls.loadSource(final); hls.startLoad(); } catch {}
-                  } catch {}
-                }, 8);
-              } catch {}
-
-              const attach = (u: string) => {
-                try { hls.loadSource(u); hls.attachMedia(v); } catch { v.src = u; }
-              };
-
-              attach(streamUrl);
-
-              hls.on(HlsLib.Events.MANIFEST_PARSED, (_: any, data: any) => {
-                try {
-                  const resume = loadResumePosition(channel.id);
-                  if (resume != null) {
-                    try { v.currentTime = resume; } catch {}
-                  }
-                } catch {}
-                if (llMode) {
-                  try { hls.currentLevel = -1; } catch {}
-                } else {
-                  if (lowEnd) try { hls.currentLevel = 0; } catch {}
-                }
-                // autoplay dance: mute first then restore
-                v.muted = true;
-                v.play()
-                  .then(() => {
-                    setTimeout(() => { v.muted = false; v.volume = 1; setIsMuted(false); setVolume(1); }, 200);
-                  })
-                  .catch(() => setTimeout(() => v.play().catch(() => {}), 300));
-              });
-
-              hls.on(HlsLib.Events.ERROR, (_: any, data: any) => {
-                if (!data) return;
-                // recoverable errors
-                if (data.details === HlsLib.ErrorDetails.BUFFER_STALLED_ERROR) {
-                  try { hls.startLoad(); } catch {}
-                  return;
-                }
-                if (!data.fatal) return;
-
-                // first try backup proxy
-                if (!triedBackup) {
-                  triedBackup = true;
-                  try { hls.destroy(); } catch {}
-                  const backup = withBackupProxy(streamUrl);
-                  if (backup !== streamUrl) {
-                    attach(backup);
-                    return;
-                  }
-                }
-
-                // network error -> likely CORS or server unreachable
-                if (data.type === HlsLib.ErrorTypes.NETWORK_ERROR) {
-                  setError("Stream blocked by source (network / CORS). Trying proxy may help.");
-                  try { hls.startLoad(); } catch {}
-                  return;
-                }
-
-                if (data.type === HlsLib.ErrorTypes.MEDIA_ERROR) {
-                  try { hls.recoverMediaError(); } catch {}
-                  return;
-                }
-
-                setError("Stream error. Please try again.");
-              });
-            }
+    const attachMpd = async (url: string) => {
+      const shaka = (window as any).shaka;
+      if (!shaka) {
+        // if shaka not loaded, try using video element directly or proxy fallback
+        try {
+          videoRef.current!.src = url;
+          await videoRef.current!.play().catch(() => {});
+          return;
+        } catch {
+          if (!triedProxy) {
+            const prox = tryProxy(url);
+            return attachMpd(prox);
           }
-        } else {
-          // direct file types (mp4, ts, direct)
-          const resume = loadResumePosition(channel.id);
-          v.src = streamUrl;
-          if (resume != null) try { v.currentTime = resume; } catch {}
-          await v.play();
+          setError('DASH playback not supported');
+          return;
         }
+      }
 
-        setIsLoading(false);
-      } catch (err: any) {
-        if (cancelled) return;
-        console.error("Player init error:", err);
-        // Provide user with clearer message when host likely blocks:
-        if (/CORS|NetworkError|403|401|net::ERR_BLOCKED_BY_CLIENT|ERR_FAILED/i.test(err?.message || "")) {
-          setError("Stream blocked by source (CORS / Hotlink). Try using the proxy or a different stream.");
-        } else {
-          setError(err?.message ?? "Playback error");
+      try {
+        shaka.polyfill.installAll?.();
+        if (!shaka.Player.isBrowserSupported()) {
+          setError('DASH not supported in this browser');
+          return;
         }
-        setIsLoading(false);
+        const player = new shaka.Player(videoRef.current);
+        shakaRef.current = player;
+        player.addEventListener('error', (e: any) => {
+          console.error('Shaka error', e);
+          // try proxy once
+          if (!triedProxy) {
+            const prox = tryProxy(url);
+            try { player.destroy(); } catch {}
+            shakaRef.current = null;
+            return attachMpd(prox);
+          }
+          setError('Playback error (DASH)');
+        });
+        await player.load(url);
+        const tracks = player.getVariantTracks?.() || [];
+        const qs = tracks.map((t: any) => `${t.height || t.bandwidth}p`);
+        setAvailableQualities(['auto', ...Array.from(new Set(qs))]);
+        await videoRef.current!.play().catch(() => {});
+      } catch (err) {
+        console.warn('Shaka load error', err);
+        if (!triedProxy) {
+          const prox = tryProxy(url);
+          return attachMpd(prox);
+        }
+        setError('DASH playback failed');
       }
     };
 
-    init();
+    const load = async () => {
+      setIsLoading(true);
+      setError(null);
+      cleanup();
+
+      const url = getStreamUrl(channel);
+      let finalUrl = url;
+
+      // Some hosts are known to require a proxy — use it early
+      if (mustProxy(url)) finalUrl = withBackupProxy(url);
+
+      try {
+        if (channel.stream_type === 'm3u8') {
+          await attachHls(finalUrl);
+        } else if (channel.stream_type === 'mpd') {
+          await attachMpd(finalUrl);
+        } else {
+          // direct file (mp4/ts/direct)
+          try {
+            videoRef.current!.src = finalUrl;
+            await videoRef.current!.play();
+          } catch (err) {
+            // try proxy
+            if (!triedProxy) {
+              finalUrl = tryProxy(finalUrl);
+              try {
+                videoRef.current!.src = finalUrl;
+                await videoRef.current!.play();
+              } catch {
+                setError('Playback failed');
+              }
+            } else {
+              setError('Playback failed');
+            }
+          }
+        }
+      } catch (err: any) {
+        console.error('Load stream error', err);
+        if (!triedProxy) {
+          finalUrl = tryProxy(finalUrl);
+          // retry once with proxy
+          try {
+            if (channel.stream_type === 'm3u8') {
+              await attachHls(finalUrl);
+            } else if (channel.stream_type === 'mpd') {
+              await attachMpd(finalUrl);
+            } else {
+              videoRef.current!.src = finalUrl;
+              await videoRef.current!.play();
+            }
+          } catch (e) {
+            setError((e as any)?.message || 'Failed to load stream (proxy attempt failed)');
+          }
+        } else {
+          setError(err.message || 'Failed to load stream');
+        }
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    };
+
+    load();
 
     return () => {
       cancelled = true;
-      try { if (hlsRef.current?.destroy) hlsRef.current.destroy(); } catch {}
-      try { if (shakaRef.current?.destroy) shakaRef.current.destroy(); } catch {}
-      try { if (jwRef.current?.remove) jwRef.current.remove(); } catch {}
-      try { if (jwManifestDetachRef.current) jwManifestDetachRef.current(); } catch {}
-      try { if (manifestPollIntervalRef.current) { clearInterval(manifestPollIntervalRef.current); manifestPollIntervalRef.current = null; } } catch {}
-      try { if (localHlsPollDetach) localHlsPollDetach(); } catch {}
+      cleanup();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [channel, getStreamUrl, jwOptions]);
+  }, [channel, cleanup, getStreamUrl]);
 
-  /* Signed URL renewal (periodic) */
-  useEffect(() => {
-    if (!channel) return;
-    let mounted = true;
-    let timerId: number | null = null;
-
-    const renewSignedStream = async () => {
-      try {
-        const { data: { user } } = await supabase.auth.getUser();
-        const { data } = await supabase.functions.invoke("get-stream", {
-          body: { url: getStreamUrl(channel), userId: user?.id ?? null, sessionId: sessionIdRef.current },
-        } as any);
-        if (!mounted) return;
-        if (data?.url) {
-          const newUrl: string = data.url;
-          streamExpiryRef.current = data.expiresAt ?? null;
-          streamCacheRef.current.set(channel.id, data);
-
-          try {
-            if (jwRef.current && typeof jwRef.current.load === "function") {
-              try { jwRef.current.load([{ file: newUrl }]); setIsLoading(false); } catch { try { jwRef.current.setup && jwRef.current.setup({ file: newUrl }); } catch {} }
-              return;
-            }
-          } catch (e) { console.warn("JW swap failed", e); }
-
-          try {
-            const HlsLib = (window as any).Hls;
-            if (hlsRef.current && HlsLib && typeof hlsRef.current.loadSource === "function") {
-              try { hlsRef.current.stopLoad?.(); } catch {}
-              try { hlsRef.current.loadSource(newUrl); hlsRef.current.startLoad?.(); setIsLoading(false); } catch (e) { console.warn("HLS swap failed", e); }
-              return;
-            }
-          } catch (e) { console.warn("HLS swap check error", e); }
-
-          try {
-            const v = videoRef.current;
-            if (v) {
-              const wasPlaying = !v.paused && !v.ended;
-              v.src = newUrl;
-              try { await v.play(); if (!wasPlaying) v.pause(); } catch {}
-              setIsLoading(false);
-            }
-          } catch (e) { console.warn("Native swap failed", e); }
-        }
-      } catch (err) {
-        console.warn("Signed stream renewal failed:", err);
-      }
-    };
-
-    const scheduleRenew = () => {
-      if (timerId) { clearTimeout(timerId); timerId = null; }
-      const expiresAt = streamExpiryRef.current;
-      const leadMs = 30_000;
-      if (expiresAt && expiresAt > Date.now() + 1000) {
-        const delay = Math.max(0, expiresAt - Date.now() - leadMs);
-        timerId = window.setTimeout(async () => { await renewSignedStream(); if (mounted) scheduleRenew(); }, delay) as unknown as number;
-      } else {
-        const fallbackMs = 4 * 60 * 1000;
-        timerId = window.setTimeout(async () => { await renewSignedStream(); if (mounted) scheduleRenew(); }, fallbackMs) as unknown as number;
-      }
-    };
-
-    (async () => {
-      try {
-        const expiresAt = streamExpiryRef.current;
-        if (expiresAt && expiresAt - Date.now() < 60_000) await renewSignedStream();
-      } catch {}
-      scheduleRenew();
-    })();
-
-    return () => { mounted = false; if (timerId) clearTimeout(timerId); };
-  }, [channel, getStreamUrl]);
-
-  /* Native events + resume saving */
+  /* Video native event handlers */
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
+
+    const onTime = () => setCurrentTime(v.currentTime);
+    const onDuration = () => setDuration(v.duration || 0);
     const onPlay = () => setIsPlaying(true);
     const onPause = () => setIsPlaying(false);
-    const onTime = () => {
-      setCurrentTime(v.currentTime);
-      setDuration(v.duration || Number.NaN);
-    };
-    const onDuration = () => setDuration(v.duration || Number.NaN);
     const onWaiting = () => setIsLoading(true);
     const onPlaying = () => setIsLoading(false);
-    const onError = () => setError("Playback error");
 
-    v.addEventListener("play", onPlay);
-    v.addEventListener("pause", onPause);
-    v.addEventListener("timeupdate", onTime);
-    v.addEventListener("durationchange", onDuration);
-    v.addEventListener("waiting", onWaiting);
-    v.addEventListener("playing", onPlaying);
-    v.addEventListener("error", onError);
-
-    let saveTimer: number | null = null;
-    const scheduleSave = () => {
-      if (!channel) return;
-      if (saveTimer) clearTimeout(saveTimer);
-      saveTimer = window.setTimeout(() => {
-        try {
-          const pos = v.currentTime;
-          if (channel?.id) saveResumePosition(channel.id, pos);
-        } catch {}
-      }, 1500) as unknown as number;
-    };
-
-    v.addEventListener("timeupdate", scheduleSave);
-
-    const onVisibility = () => {
-      if (document.hidden) {
-        try {
-          const pos = v.currentTime;
-          if (channel?.id) saveResumePosition(channel.id, pos);
-        } catch {}
-      }
-    };
-    document.addEventListener("visibilitychange", onVisibility);
+    v.addEventListener('timeupdate', onTime);
+    v.addEventListener('durationchange', onDuration);
+    v.addEventListener('play', onPlay);
+    v.addEventListener('pause', onPause);
+    v.addEventListener('waiting', onWaiting);
+    v.addEventListener('playing', onPlaying);
 
     return () => {
-      v.removeEventListener("play", onPlay);
-      v.removeEventListener("pause", onPause);
-      v.removeEventListener("timeupdate", onTime);
-      v.removeEventListener("durationchange", onDuration);
-      v.removeEventListener("waiting", onWaiting);
-      v.removeEventListener("playing", onPlaying);
-      v.removeEventListener("error", onError);
-      v.removeEventListener("timeupdate", scheduleSave);
-      if (saveTimer) clearTimeout(saveTimer);
-      document.removeEventListener("visibilitychange", onVisibility);
-      try { if (channel?.id && v) saveResumePosition(channel.id, v.currentTime); } catch {}
+      v.removeEventListener('timeupdate', onTime);
+      v.removeEventListener('durationchange', onDuration);
+      v.removeEventListener('play', onPlay);
+      v.removeEventListener('pause', onPause);
+      v.removeEventListener('waiting', onWaiting);
+      v.removeEventListener('playing', onPlaying);
     };
-  }, [channel]);
+  }, []);
 
-  /* Controls API */
-  const togglePlay = useCallback(() => {
-    if (jwRef.current) {
-      try {
-        const state = jwRef.current.getState?.();
-        if (state === "playing") jwRef.current.pause?.(); else jwRef.current.play?.();
-      } catch {}
-      return;
-    }
-    const v = videoRef.current;
-    if (!v) return;
-    if (isPlaying) v.pause(); else v.play().catch(() => {});
-  }, [isPlaying]);
+  /* Controls visibility */
+  const showControlsTemporarily = useCallback(() => {
+    setShowControls(true);
+    if (controlsTimeoutRef.current) window.clearTimeout(controlsTimeoutRef.current);
+    controlsTimeoutRef.current = window.setTimeout(() => {
+      setShowControls(false);
+    }, 3000) as unknown as number;
+  }, []);
 
-  const seekTo = (t: number) => {
-    if (jwRef.current && jwRef.current.seek) {
-      try { jwRef.current.seek(t); } catch {}
-      return;
-    }
-    const v = videoRef.current;
-    if (!v) return;
-    v.currentTime = Math.max(0, Math.min((v.duration || 0), t));
+  /* Fullscreen handler */
+  useEffect(() => {
+    const onFs = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onFs);
+    return () => document.removeEventListener('fullscreenchange', onFs);
+  }, []);
+
+  /* Playback control functions (kept UI behavior) */
+  const togglePlay = () => {
+    if (!videoRef.current) return;
+    if (isPlaying) videoRef.current.pause();
+    else videoRef.current.play().catch(() => {});
   };
 
   const toggleMute = () => {
-    const v = videoRef.current;
-    if (v) { v.muted = !isMuted; setIsMuted(!isMuted); if (!isMuted && v.volume === 0) { v.volume = 0.5; setVolume(0.5); } }
-    else if (jwRef.current?.setVolume) { try { const nm = !isMuted; jwRef.current.setVolume(nm ? 0 : Math.round((volume || 1) * 100)); setIsMuted(nm); } catch {} }
+    if (!videoRef.current) return;
+    videoRef.current.muted = !isMuted;
+    setIsMuted(!isMuted);
   };
 
-  const changeVolume = (v: number) => {
-    const vol = Math.max(0, Math.min(1, v));
-    const elm = videoRef.current;
-    if (elm) { elm.volume = vol; setVolume(vol); setIsMuted(vol === 0); }
-    else if (jwRef.current?.setVolume) { try { jwRef.current.setVolume(Math.round(vol * 100)); setVolume(vol); setIsMuted(vol === 0); } catch {} }
+  const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value);
+    setVolume(val);
+    if (videoRef.current) {
+      videoRef.current.volume = val;
+      setIsMuted(val === 0);
+    }
   };
 
-  const toggleFullscreen = async () => {
+  const toggleFullscreen = () => {
     if (!containerRef.current) return;
-    if (!document.fullscreenElement) {
-      try { await containerRef.current.requestFullscreen(); setIsFullscreen(true); } catch {}
-    } else {
-      try { await document.exitFullscreen(); setIsFullscreen(false); } catch {}
+    if (!document.fullscreenElement) containerRef.current.requestFullscreen().catch(() => {});
+    else document.exitFullscreen().catch(() => {});
+  };
+
+  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const t = parseFloat(e.target.value);
+    if (videoRef.current) {
+      videoRef.current.currentTime = t;
+      setCurrentTime(t);
     }
   };
 
-  /* keyboard */
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const active = document.activeElement;
-      if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || (active as HTMLElement).isContentEditable)) return;
-      if (e.code === "Space") { e.preventDefault(); togglePlay(); showControlsTemporarily(); }
-      else if (e.key === "ArrowLeft") { seekTo(currentTime - 5); showControlsTemporarily(); }
-      else if (e.key === "ArrowRight") { seekTo(currentTime + 5); showControlsTemporarily(); }
-      else if (e.key === "ArrowUp") { changeVolume((volume || 0) + 0.1); showControlsTemporarily(); }
-      else if (e.key === "ArrowDown") { changeVolume((volume || 0) - 0.1); showControlsTemporarily(); }
-      else if (e.key.toLowerCase() === "m") { toggleMute(); showControlsTemporarily(); }
-      else if (e.key.toLowerCase() === "f") { toggleFullscreen(); }
-      else if (e.key === "Escape") { if (document.fullscreenElement) document.exitFullscreen(); }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, currentTime, volume, toggleMute]);
-
-  const formatTime = (s: number) => {
-    if (!isFinite(s)) return "--:--";
-    const m = Math.floor(s / 60);
-    const sec = Math.floor(s % 60);
-    return `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+  const formatTime = (time: number) => {
+    if (!isFinite(time) || time <= 0) return '00:00';
+    const m = Math.floor(time / 60);
+    const s = Math.floor(time % 60);
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   };
 
-  const getSeekBackground = () => {
-    try {
-      const pct = isFinite(duration) && duration > 0 ? Math.max(0, Math.min(100, (currentTime / duration) * 100)) : (duration ? 0 : Math.min(100, currentTime / (currentTime + 1) * 100));
-      const track = `linear-gradient(90deg, #8b5cf6 ${pct}%, rgba(255,255,255,0.12) ${pct}%)`;
-      return track;
-    } catch {
-      return undefined;
+  const handleQualityChange = (q: string) => {
+    setQuality(q);
+    setShowSettings(false);
+    // Basic HLS / Shaka quality switching (if supported)
+    if (hlsRef.current) {
+      if (q === 'auto') hlsRef.current.currentLevel = -1;
+      else {
+        const level = hlsRef.current.levels?.findIndex((l: any) => `${l.height || l.bitrate}p` === q);
+        if (level !== -1) hlsRef.current.currentLevel = level;
+      }
+    }
+    if (shakaRef.current) {
+      const tracks = shakaRef.current.getVariantTracks?.() || [];
+      if (q === 'auto') shakaRef.current.configure({ abr: { enabled: true } });
+      else {
+        const track = tracks.find((t: any) => `${t.height || t.bandwidth}p` === q);
+        if (track) {
+          shakaRef.current.configure({ abr: { enabled: false } });
+          shakaRef.current.selectVariantTrack(track, true);
+        }
+      }
     }
   };
 
-  // Render UI (keeps the design you posted)
-  if (!channel) {
+  // YouTube short-circuit
+  if (channel?.stream_type === 'youtube') {
+    const videoId = (channel.stream_url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)([^"&?/ ]{11})/) || [])[1];
     return (
-      <div className="w-full h-full flex items-center justify-center bg-gray-950 relative overflow-hidden">
-        <div className="flex flex-col items-center justify-center animate-fade-in">
-          <img src="/logo-main.png" alt="PinoyTambayanTV" className="w-48 h-48 md:w-64 md:h-64 object-contain opacity-90" />
-          <p className="mt-6 text-gray-400 font-mono tracking-widest text-sm">SELECT A CHANNEL TO START</p>
-        </div>
-        <style>{`
-          @keyframes fadeInSmooth { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
-          .animate-fade-in { animation: fadeInSmooth 0.6s ease-out both; }
-        `}</style>
+      <div ref={containerRef} className="relative w-full aspect-video bg-black rounded-lg overflow-hidden" style={{ boxShadow: '0 0 30px rgba(0,0,0,0.8)', border: '4px solid #5d4037' }}>
+        <iframe
+          src={`https://www.youtube.com/embed/${videoId}?autoplay=1&rel=0`}
+          className="w-full h-full"
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+          allowFullScreen
+        />
       </div>
     );
   }
-
-  // YouTube embed short-circuit
-  if (channel.stream_type === "youtube") {
-    const url = getStreamUrl(channel);
-    const match = url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)([^"&?/ ]{11})/);
-    const videoId = match?.[1];
-    if (!videoId) return <div className="w-full h-full flex items-center justify-center bg-black text-red-500 font-mono">INVALID YOUTUBE URL</div>;
-    const origin = typeof window !== "undefined" ? window.location.origin : "";
-    return (
-      <div ref={containerRef} className="w-full h-full bg-black relative">
-        <iframe key={videoId} className="w-full h-full" src={`https://www.youtube.com/embed/${videoId}?autoplay=1&mute=1&playsinline=1&origin=${encodeURIComponent(origin)}`} frameBorder="0" allow="autoplay; encrypted-media" allowFullScreen />
-      </div>
-    );
-  }
-
-  const containerHandlers = isDesktopView ? {
-    onMouseEnter: () => { setControlsVisible(true); },
-    onMouseLeave: () => { if (controlsTimerRef.current) { clearTimeout(controlsTimerRef.current); controlsTimerRef.current = null; } setControlsVisible(false); },
-  } : {};
 
   return (
     <div
       ref={containerRef}
-      className="w-full h-full bg-black relative select-none"
-      onMouseMove={() => showControlsTemporarily()}
-      onClick={() => showControlsTemporarily()}
-      onDoubleClick={() => toggleFullscreen()}
-      {...containerHandlers}
+      className="relative w-full aspect-video bg-black rounded-lg overflow-hidden group"
+      onMouseMove={showControlsTemporarily}
+      onMouseLeave={() => setShowControls(false)}
+      style={{
+        boxShadow: '0 0 30px rgba(0,0,0,0.8), inset 0 0 60px rgba(139, 69, 19, 0.3)',
+        border: '4px solid #5d4037'
+      }}
     >
-      <style>{`
-        .robot-btn { display:inline-flex; align-items:center; justify-content:center; background: rgba(16,16,16,0.64); border: 1px solid rgba(255,255,255,0.06); box-shadow: none; color: #fff; border-radius: 6px; padding: 6px; transition: background .12s, transform .06s;}
-        .robot-btn:active { transform: translateY(1px); }
-        input[type=range] { -webkit-appearance: none; appearance: none; background: transparent; }
-        input[type=range]::-webkit-slider-runnable-track { height: 10px; background: rgba(255,255,255,0.12); border-radius: 6px; }
-        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 14px; width: 14px; border-radius: 50%; margin-top: -2px; background: #8b5cf6; box-shadow: 0 0 0 4px rgba(139,92,246,0.12); border: 2px solid #fff; }
-        @media (min-width: 1024px) {
-          .controls-row { padding: 8px 18px; gap: 12px; }
-        }
-      `}</style>
+      <video ref={videoRef} className="w-full h-full object-contain" playsInline onClick={togglePlay} />
 
-      <video ref={videoRef} className="w-full h-full object-contain bg-black" playsInline autoPlay controls={false} />
+      {!channel && <StaticNoise />}
 
-      <div ref={(el) => { if (el && !jwContainerRef.current) jwContainerRef.current = el; }} id="jw-player-container" style={{ position: "absolute", inset: 0, display: jwOptions?.useJw ? "block" : "none" }} />
-
-      {/* Close */}
-      {onClose && (
-        <button onClick={(e) => { e.stopPropagation(); onClose(); }} className="absolute top-3 right-3 z-50 robot-btn" aria-label="Close">
-          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-        </button>
-      )}
-
-      {/* watermark */}
-      <div className="absolute top-3 right-14 z-40 pointer-events-none">
-        <img src="/logo-header.png" alt="logo" className="w-10 h-10 opacity-95 drop-shadow-xl" />
-      </div>
-
-      {isLoading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-50">
-          <LoadingSpinner size="lg" />
-        </div>
-      )}
+      {isLoading && channel && <LoadingSpinner />}
 
       {error && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/90 z-50">
+        <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-20">
           <div className="text-center">
-            <p className="text-red-400 font-mono mb-3">{error}</p>
-            <button onClick={() => window.location.reload()} className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-mono rounded">RETRY</button>
+            <p className="text-red-400 text-lg font-medium mb-2">Error</p>
+            <p className="text-white/60 text-sm">{error}</p>
           </div>
         </div>
       )}
 
-      {/* Controls */}
-      <div className={`absolute left-0 right-0 bottom-0 z-50 transition-opacity ${controlsVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`}>
-        <div className="backdrop-blur-sm bg-black/45 px-3 py-2 flex items-center controls-row justify-between">
-          <div className="flex items-center gap-2">
-            <button onClick={(e) => { e.stopPropagation(); togglePlay(); }} aria-label="Play/Pause" className="robot-btn" style={{ width: isDesktopView ? 44 : 36, height: isDesktopView ? 44 : 36 }}>
-              {!isPlaying ? (
-                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path d="M5 3v18l15-9L5 3z" /></svg>
-              ) : (
-                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h4v12H6zM14 6h4v12h-4z" /></svg>
-              )}
-            </button>
+      {/* Controls Overlay (keeps your original controls) */}
+      {channel && (
+        <div className={`absolute inset-x-0 bottom-0 transition-all duration-300 ${showControls ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4'}`} style={{ background: 'linear-gradient(to top, rgba(62, 39, 35, 0.95), rgba(62, 39, 35, 0.7), transparent)', borderTop: '2px solid #8d6e63' }}>
+          {duration > 0 && (
+            <div className="px-4 pt-2">
+              <input
+                type="range"
+                min={0}
+                max={duration}
+                value={currentTime}
+                onChange={handleSeek}
+                className="w-full h-1 appearance-none cursor-pointer rounded-full"
+                style={{
+                  background: `linear-gradient(to right, #fbbf24 0%, #fbbf24 ${(currentTime / (duration || 1)) * 100}%, #5d4037 ${(currentTime / (duration || 1)) * 100}%, #5d4037 100%)`
+                }}
+              />
+            </div>
+          )}
 
-            <div className="text-xs font-mono text-gray-300 w-14 text-left pl-1">
-              {formatTime(currentTime)}
+          <div className="flex items-center justify-between px-4 py-2">
+            <div className="flex items-center gap-2 md:gap-4">
+              {onChannelChange && (
+                <button onClick={() => onChannelChange('prev')} className="p-2 text-amber-200 hover:text-amber-400 transition-colors"><SkipBack className="w-5 h-5" /></button>
+              )}
+
+              <button onClick={togglePlay} className="p-2 bg-amber-600/50 rounded-full text-amber-100 hover:bg-amber-600 transition-colors">
+                {isPlaying ? <Pause className="w-5 h-5 md:w-6 md:h-6" /> : <Play className="w-5 h-5 md:w-6 md:h-6" />}
+              </button>
+
+              {onChannelChange && (
+                <button onClick={() => onChannelChange('next')} className="p-2 text-amber-200 hover:text-amber-400 transition-colors"><SkipForward className="w-5 h-5" /></button>
+              )}
+
+              <div className="flex items-center gap-2">
+                <button onClick={toggleMute} className="p-2 text-amber-200 hover:text-amber-400 transition-colors">
+                  {isMuted || volume === 0 ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.1}
+                  value={isMuted ? 0 : volume}
+                  onChange={handleVolumeChange}
+                  className="w-16 md:w-24 h-1 appearance-none cursor-pointer rounded-full hidden sm:block"
+                  style={{
+                    background: `linear-gradient(to right, #fbbf24 0%, #fbbf24 ${(isMuted ? 0 : volume) * 100}%, #5d4037 ${(isMuted ? 0 : volume) * 100}%, #5d4037 100%)`
+                  }}
+                />
+              </div>
+
+              <span className="text-amber-200 text-xs md:text-sm font-mono hidden sm:block">
+                {formatTime(currentTime)} / {formatTime(duration)}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <div className="relative">
+                <button onClick={() => setShowSettings(!showSettings)} className="p-2 text-amber-200 hover:text-amber-400 transition-colors">
+                  <Settings className="w-5 h-5" />
+                </button>
+                {showSettings && (
+                  <div className="absolute bottom-full right-0 mb-2 bg-amber-900/95 rounded-lg shadow-xl border border-amber-700 overflow-hidden min-w-[120px]">
+                    <div className="px-3 py-2 border-b border-amber-700 text-amber-200 text-xs font-medium">Quality</div>
+                    {availableQualities.map(q => (
+                      <button key={q} onClick={() => handleQualityChange(q)} className={`w-full px-3 py-2 text-left text-sm ${quality === q ? 'bg-amber-600 text-white' : 'text-amber-200 hover:bg-amber-800'}`}>{q}</button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <button onClick={toggleFullscreen} className="p-2 text-amber-200 hover:text-amber-400 transition-colors">
+                {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
+              </button>
             </div>
           </div>
-
-          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <input
-              aria-label="Seek"
-              type="range"
-              min={0}
-              max={isFinite(duration) ? duration : Math.max(0, currentTime + 1)}
-              step={0.1}
-              value={isFinite(duration) ? Math.min(currentTime, duration) : currentTime}
-              onChange={(e) => seekTo(Number(e.target.value))}
-              onMouseDown={(e) => e.stopPropagation()}
-              onTouchStart={(e) => e.stopPropagation()}
-              style={{
-                width: isDesktopView ? "70%" : "50%",
-                maxWidth: isDesktopView ? "1200px" : "60%",
-                background: getSeekBackground(),
-                height: isDesktopView ? 12 : 8,
-              }}
-            />
-          </div>
-
-          <div className="flex items-center gap-2">
-            {(isDesktopView || isFinite(duration)) && (
-              <div className="text-xs font-mono text-gray-300 w-14 text-right pr-1">
-                {isFinite(duration) ? formatTime(duration) : ""}
-              </div>
-            )}
-
-            <button onClick={(e) => { e.stopPropagation(); toggleMute(); }} aria-label="Mute" className="robot-btn" style={{ width: isDesktopView ? 44 : 36, height: isDesktopView ? 44 : 36 }}>
-              {isMuted || volume === 0 ? (
-                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path d="M16.5 12l3.5 3.5-1.5 1.5L15 13.5 11.5 17H6v-10h5.5L15 10.5l4-4 1.5 1.5L16.5 12z" /></svg>
-              ) : (
-                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path d="M3 10v4h4l5 5V5L7 10H3zM16 12c0-1.77-.77-3.37-2-4.47v8.94A5.978 5.978 0 0 0 16 12z" /></svg>
-              )}
-            </button>
-
-            <input
-              aria-label="Volume"
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={volume}
-              onChange={(e) => changeVolume(Number(e.target.value))}
-              className="w-20 md:w-24"
-              onMouseDown={(e) => e.stopPropagation()}
-              onTouchStart={(e) => e.stopPropagation()}
-              style={{ height: isDesktopView ? 10 : 6, background: `linear-gradient(90deg,#8b5cf6 ${volume * 100}%, rgba(255,255,255,0.12) ${volume * 100}%)` }}
-            />
-
-            <button onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }} aria-label="Fullscreen" className="robot-btn" style={{ width: isDesktopView ? 44 : 36, height: isDesktopView ? 44 : 36 }}>
-              <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={isFullscreen ? "M9 11H5a2 2 0 0 0-2 2v4" : "M3 3h6v6M21 21h-6v-6"} /></svg>
-            </button>
-          </div>
         </div>
-      </div>
+      )}
+
+      {channel && showControls && (
+        <div className="absolute top-4 left-4 bg-amber-900/80 px-3 py-1 rounded-lg">
+          <p className="text-amber-100 text-sm font-medium">{channel.name}</p>
+        </div>
+      )}
     </div>
   );
 };
+
+/* Add minimal window types for runtime checks */
+declare global {
+  interface Window {
+    Hls?: any;
+    shaka?: any;
+  }
+}
 
 export default VideoPlayer;
