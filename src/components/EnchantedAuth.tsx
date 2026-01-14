@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from "react";
 import { Lock, Unlock, Eye, EyeOff, Sparkles, X } from "lucide-react";
 import { useAuth, generateDeviceFingerprint } from "@/contexts/AuthContext";
-import supabase from "@/lib/supabase";
+import { supabase } from "@/lib/supabase";
+
 
 const DEVIL_BOOK =
   "https://d64gsuwffb70l.cloudfront.net/6966ff2969d41bac5afce556_1768357781130_1774fa95.jpg";
