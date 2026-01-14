@@ -1,8 +1,8 @@
+// src/components/EnchantedAuth.tsx
 import React, { useState, useEffect } from "react";
 import { Lock, Unlock, Eye, EyeOff, Sparkles, X } from "lucide-react";
 import { useAuth, generateDeviceFingerprint } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
-
 
 const DEVIL_BOOK =
   "https://d64gsuwffb70l.cloudfront.net/6966ff2969d41bac5afce556_1768357781130_1774fa95.jpg";
@@ -40,7 +40,6 @@ const EnchantedAuth: React.FC<EnchantedAuthProps> = ({ onAuthSuccess }) => {
   const [confirmPassword, setConfirmPassword] = useState("");
 
   useEffect(() => {
-    // Generate floating particles
     const newParticles = Array.from({ length: 30 }, (_, i) => ({
       id: i,
       x: Math.random() * 100,
@@ -106,7 +105,7 @@ const EnchantedAuth: React.FC<EnchantedAuthProps> = ({ onAuthSuccess }) => {
           return;
         }
 
-        // 1) Create Auth user
+        // Create auth user only (do NOT attempt client-side insert into public.users if you have RLS)
         const { data, error: signUpError } = await supabase.auth.signUp({
           email,
           password,
@@ -126,53 +125,14 @@ const EnchantedAuth: React.FC<EnchantedAuthProps> = ({ onAuthSuccess }) => {
           return;
         }
 
-        // 2) Insert into public.users table so admin panel and other code see this user
-        // Note: we store a sentinel in password_hash to indicate Auth-managed password
-        const { error: insertError } = await supabase.from("users").insert({
-          id: authUser.id,
-          email: authUser.email,
-          username: username,
-          password_hash: "supabase",
-          device_fingerprint: deviceFingerprint || null,
-          is_admin: false,
-          is_banned: false,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        });
-
-        if (insertError) {
-          // If the insert fails because row already exists, we allow signup but show message.
-          console.error("Insert into users table failed:", insertError);
-          // If it's a unique violation, show a friendly message
-          if (
-            insertError.code === "23505" ||
-            /duplicate/i.test(insertError.message || "")
-          ) {
-            setSuccessMessage(
-              "Account created. A user record already existed — please log in."
-            );
-          } else {
-            setError(
-              insertError.message ||
-                "Failed to create user record — contact support."
-            );
-            setIsLoading(false);
-            return;
-          }
-        } else {
-          setSuccessMessage(
-            "Account created successfully! Please log in to continue."
-          );
-        }
-
-        // 3) After signup, DO NOT auto-login — switch to login form per your request
+        // Signup success -> show message and switch to login form (do not auto-login)
+        setSuccessMessage("Account created successfully! Please log in to continue.");
         setAuthMode("login");
-        // Keep the email prefilled and clear password fields for login
+        // prefill email and clear passwords for user convenience
         setPassword("");
         setConfirmPassword("");
-        // Optionally focusable: set a small delay then show message
       } else {
-        // LOGIN flow uses useAuth().login for existing login logic
+        // LOGIN flow uses useAuth().login
         const result = await login(email, password, deviceFingerprint);
         if (result.success) {
           onAuthSuccess();
@@ -463,95 +423,95 @@ const EnchantedAuth: React.FC<EnchantedAuthProps> = ({ onAuthSuccess }) => {
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  required
-                  className="w-full px-4 py-3 bg-black/30 border border-white/20 rounded-xl text-white placeholder-white/40 focus:outline-none focus:border-white/50 transition-colors"
-                  placeholder="Enter your email"
-                />
-              </div>
-
-              <div>
-                <label className="block text-white/80 text-sm font-medium mb-1">Password</label>
-                <div className="relative">
-                  <input
-                    type={showPassword ? "text" : "password"}
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    required
-                    className="w-full px-4 py-3 bg-black/30 border border-white/20 rounded-xl text-white placeholder-white/40 focus:outline-none focus:border-white/50 transition-colors pr-12"
-                    placeholder="Enter your password"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-white/60 hover:text-white"
-                  >
-                    {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                  </button>
-                </div>
-              </div>
-
-              {authMode === "signup" && (
-                <div>
-                  <label className="block text-white/80 text-sm font-medium mb-1">Confirm Password</label>
-                  <input
-                    type="password"
-                    value={confirmPassword}
-                    onChange={(e) => setConfirmPassword(e.target.value)}
                     required
                     className="w-full px-4 py-3 bg-black/30 border border-white/20 rounded-xl text-white placeholder-white/40 focus:outline-none focus:border-white/50 transition-colors"
-                    placeholder="Confirm your password"
+                    placeholder="Enter your email"
                   />
                 </div>
-              )}
 
-              <button
-                type="submit"
-                disabled={isLoading}
-                className={`w-full py-3 rounded-xl font-bold text-white transition-all transform hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed
-                  ${authMode === "login"
-                    ? "bg-gradient-to-r from-yellow-500 to-amber-600 hover:from-yellow-600 hover:to-amber-700"
-                    : "bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700"}`}
-                style={{
-                  boxShadow:
-                    authMode === "login"
-                      ? "0 0 20px rgba(234, 179, 8, 0.4)"
-                      : "0 0 20px rgba(220, 38, 38, 0.4)",
-                }}
-              >
-                {isLoading ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                    Processing...
-                  </span>
-                ) : authMode === "login" ? (
-                  "Enter the Light"
-                ) : (
-                  "Embrace the Darkness"
+                <div>
+                  <label className="block text-white/80 text-sm font-medium mb-1">Password</label>
+                  <div className="relative">
+                    <input
+                      type={showPassword ? "text" : "password"}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      required
+                      className="w-full px-4 py-3 bg-black/30 border border-white/20 rounded-xl text-white placeholder-white/40 focus:outline-none focus:border-white/50 transition-colors pr-12"
+                      placeholder="Enter your password"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-white/60 hover:text-white"
+                    >
+                      {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                    </button>
+                  </div>
+                </div>
+
+                {authMode === "signup" && (
+                  <div>
+                    <label className="block text-white/80 text-sm font-medium mb-1">Confirm Password</label>
+                    <input
+                      type="password"
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      required
+                      className="w-full px-4 py-3 bg-black/30 border border-white/20 rounded-xl text-white placeholder-white/40 focus:outline-none focus:border-white/50 transition-colors"
+                      placeholder="Confirm your password"
+                    />
+                  </div>
                 )}
-              </button>
-            </form>
 
-            {/* Switch Mode */}
-            <div className="mt-6 text-center">
-              <button
-                onClick={() => {
-                  setAuthMode(authMode === "login" ? "signup" : "login");
-                  setError("");
-                  setSuccessMessage("");
-                }}
-                className="text-white/60 hover:text-white text-sm transition-colors"
-              >
-                {authMode === "login"
-                  ? "Don't have an account? Sign up with the Devil's Book"
-                  : "Already have an account? Login with the Angel's Book"}
-              </button>
+                <button
+                  type="submit"
+                  disabled={isLoading}
+                  className={`w-full py-3 rounded-xl font-bold text-white transition-all transform hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed
+                    ${authMode === "login"
+                      ? "bg-gradient-to-r from-yellow-500 to-amber-600 hover:from-yellow-600 hover:to-amber-700"
+                      : "bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700"}`}
+                  style={{
+                    boxShadow:
+                      authMode === "login"
+                        ? "0 0 20px rgba(234, 179, 8, 0.4)"
+                        : "0 0 20px rgba(220, 38, 38, 0.4)",
+                  }}
+                >
+                  {isLoading ? (
+                    <span className="flex items-center justify-center gap-2">
+                      <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                      </svg>
+                      Processing...
+                    </span>
+                  ) : authMode === "login" ? (
+                    "Enter the Light"
+                  ) : (
+                    "Embrace the Darkness"
+                  )}
+                </button>
+              </form>
+
+              {/* Switch Mode */}
+              <div className="mt-6 text-center">
+                <button
+                  onClick={() => {
+                    setAuthMode(authMode === "login" ? "signup" : "login");
+                    setError("");
+                    setSuccessMessage("");
+                  }}
+                  className="text-white/60 hover:text-white text-sm transition-colors"
+                >
+                  {authMode === "login"
+                    ? "Don't have an account? Sign up with the Devil's Book"
+                    : "Already have an account? Login with the Angel's Book"}
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
       {/* Custom Animations */}
       <style>{`
