@@ -52,15 +52,6 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
     return matchesCategory && matchesSearch;
   });
 
-  // Also prepare groupedChannels for when you want to display other categories in grouped view
-  const groupedChannels = channels
-    .filter(ch => ch.name.toLowerCase().includes(searchQuery.toLowerCase()))
-    .reduce((acc, channel) => {
-      if (!acc[channel.category]) acc[channel.category] = [];
-      acc[channel.category].push(channel);
-      return acc;
-    }, {} as Record<string, Channel[]>);
-
   return (
     <>
       {/* Toggle Button */}
@@ -170,31 +161,6 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
                   />
                 ))}
               </div>
-
-              {/* Optionally, show other categories as grouped lists below the focused category */}
-              {Object.entries(groupedChannels)
-                .filter(([cat]) => cat !== selectedCategory)
-                .map(([category, categoryChannels]) => (
-                  <div key={category} className="mt-6">
-                    <h3 
-                      className={`px-3 py-2 text-sm font-bold rounded-lg mb-2 ${CATEGORY_GEMS[category as Category]}`}
-                      style={{ boxShadow: '0 0 10px rgba(0,0,0,0.3)' }}
-                    >
-                      {category}
-                    </h3>
-                    <div className="space-y-1">
-                      {categoryChannels.map((channel) => (
-                        <ChannelItem
-                          key={channel.id}
-                          channel={channel}
-                          isSelected={selectedChannel?.id === channel.id}
-                          onSelect={onChannelSelect}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                ))
-              }
             </div>
           )}
         </div>
