@@ -1,7 +1,6 @@
 // src/components/VideoPlayer.tsx
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
-import LoadingSpinner from "./LoadingSpinner";
 import { Channel } from "@/types";
 
 /**
