@@ -1,40 +1,37 @@
 // VideoPlayer.tsx
-import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, SkipBack, SkipForward } from "lucide-react";
-import { Channel } from "@/types";
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, SkipBack, SkipForward } from 'lucide-react';
+import { Channel } from '@/types';
 
 /**
- * Enhanced VideoPlayer
- * - Auto-detects stream type (mono-hls | hls | dash/mpd | mp4/ts/direct | youtube)
- * - Picks the best engine:
- *   - Shaka for DASH / Widevine
- *   - HLS.js for HLS (including mono TS HLS)
- *   - JW Player optionally for some HLS/MP4 (but skips mono)
- *   - Native fallback for simplest cases
- * - Optional refreshStream(originalUrl) -> { url, expiresAt } to renew signed URLs
- * - Backup proxy fallback (withBackupProxy) used if engine fails
+ * HLS-only player (Shaka for DASH/MPD), no JW.
+ * - Auto reconnect when TS/fragments stall
+ * - Segment watchdog + retry/backoff + backup-proxy fallback
+ * - Resume position saved in localStorage
  *
- * Usage: <VideoPlayer channel={channel} onChannelChange={...} refreshStream={optionalFn} />
+ * Props:
+ *  - channel: Channel | null
+ *  - onChannelChange?: (direction) => void
+ *  - refreshStream?: (url) => Promise<{ url:string, expiresAt?:number } | null>
  */
 
 interface VideoPlayerProps {
   channel: Channel | null;
   onChannelChange?: (direction: 'prev' | 'next') => void;
-  // optional function to get renewed / signed URL: (origUrl) => { url, expiresAt? } | null
   refreshStream?: (origUrl: string) => Promise<{ url: string; expiresAt?: number } | null>;
 }
 
-/* ----------------------------- UI helpers (unchanged-ish) ----------------------------- */
+/* --------------------------- UI pieces (kept similar to yours) --------------------------- */
 
 const LoadingSpinner: React.FC<{ size?: 'sm' | 'lg' }> = ({ size = 'sm' }) => (
   <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-20">
-    <div className="flex gap-1 mb-4">
+    <div className={`flex gap-1 mb-4 ${size === 'lg' ? 'text-4xl' : 'text-2xl'}`}>
       {'LOADING'.split('').map((letter, i) => (
         <span
           key={i}
-          className={`text-${size === 'lg' ? '4xl' : '2xl'} md:text-4xl font-bold text-amber-400 animate-bounce`}
+          className="font-bold text-amber-400 animate-bounce"
           style={{
-            animationDelay: `${i * 0.05}s`,
+            animationDelay: `${i * 0.08}s`,
             textShadow: '0 0 10px rgba(251, 191, 36, 0.8), 0 0 20px rgba(251, 191, 36, 0.5)'
           }}
         >
@@ -49,21 +46,22 @@ const LoadingSpinner: React.FC<{ size?: 'sm' | 'lg' }> = ({ size = 'sm' }) => (
 const StaticNoise: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   useEffect(() => {
-    const c = canvasRef.current;
-    if (!c) return;
-    const ctx = c.getContext('2d');
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
     if (!ctx) return;
     let raf = 0;
     const draw = () => {
-      const w = c.width;
-      const h = c.height;
-      const imageData = ctx.createImageData(w, h);
-      const data = imageData.data;
-      for (let i = 0; i < data.length; i += 4) {
-        const v = Math.random() * 255;
-        data[i] = v; data[i+1] = v; data[i+2] = v; data[i+3] = 255;
+      const w = canvas.width = canvas.offsetWidth || 300;
+      const h = canvas.height = canvas.offsetHeight || 150;
+      const id = ctx.createImageData(w, h);
+      const d = id.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const v = (Math.random() * 255) | 0;
+        d[i] = d[i + 1] = d[i + 2] = v;
+        d[i + 3] = 255;
       }
-      ctx.putImageData(imageData, 0, 0);
+      ctx.putImageData(id, 0, 0);
       raf = requestAnimationFrame(draw);
     };
     draw();
@@ -71,7 +69,7 @@ const StaticNoise: React.FC = () => {
   }, []);
   return (
     <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900">
-      <canvas ref={canvasRef} width={300} height={200} className="w-full h-full object-cover opacity-30" />
+      <canvas ref={canvasRef} className="w-full h-full object-cover opacity-30" />
       <div className="absolute inset-0 flex flex-col items-center justify-center">
         <p className="text-white/60 text-lg font-medium mb-2">No Signal</p>
         <p className="text-white/40 text-sm">Select a channel to start watching</p>
@@ -80,7 +78,7 @@ const StaticNoise: React.FC = () => {
   );
 };
 
-/* --------------------------- Playback helpers & config --------------------------- */
+/* --------------------------- playback helpers & config --------------------------- */
 
 const BACKUP_PROXY = "https://poohlover.serv00.net";
 const FORCE_PROXY_HOSTS = [
@@ -105,100 +103,43 @@ function loadResumePosition(channelId: string): number | null {
   try {
     const raw = localStorage.getItem(`${RESUME_KEY_PREFIX}${channelId}`);
     if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed.pos !== 'number' || typeof parsed.ts !== 'number') return null;
-    if (Date.now() - parsed.ts > RESUME_TTL) { localStorage.removeItem(`${RESUME_KEY_PREFIX}${channelId}`); return null; }
-    return parsed.pos;
+    const p = JSON.parse(raw);
+    if (!p || typeof p.pos !== 'number' || typeof p.ts !== 'number') return null;
+    if (Date.now() - p.ts > RESUME_TTL) { localStorage.removeItem(`${RESUME_KEY_PREFIX}${channelId}`); return null; }
+    return p.pos;
   } catch { return null; }
 }
 
-const loadScript = (src: string) =>
-  new Promise<void>((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) return resolve();
-    const s = document.createElement('script');
-    s.src = src;
-    s.async = true;
-    s.onload = () => resolve();
-    s.onerror = (e) => reject(e);
-    document.head.appendChild(s);
-  });
+const loadScript = (src: string) => new Promise<void>((resolve, reject) => {
+  if (document.querySelector(`script[src="${src}"]`)) return resolve();
+  const s = document.createElement('script');
+  s.src = src;
+  s.async = true;
+  s.onload = () => resolve();
+  s.onerror = (e) => reject(e);
+  document.head.appendChild(s);
+});
 
-/* quick probe to determine type of manifest/stream
-   returns: 'mono-hls' | 'hls' | 'dash' | 'mp4' | 'unknown'
-*/
-async function probeStream(url: string, timeoutMs = 4000): Promise<'mono-hls' | 'hls' | 'dash' | 'mp4' | 'unknown'> {
-  // HEAD first to check content-type quickly
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const r = await fetch(url, { method: 'GET', cache: 'no-store', signal: controller.signal });
-    clearTimeout(id);
-    if (!r.ok) return 'unknown';
-    const contentType = (r.headers.get('content-type') || '').toLowerCase();
-
-    // if content-type indicates HLS
-    if (contentType.includes('mpegurl') || contentType.includes('vnd.apple.mpegurl') || contentType.includes('application/x-mpegurl')) {
-      const body = await r.text();
-      const hasStreamInf = /#EXT-X-STREAM-INF/.test(body);
-      const hasMap = /#EXT-X-MAP/.test(body);
-      const hasExtinf = /#EXTINF/.test(body);
-      const hasTs = /\.ts\b/i.test(body);
-
-      if (hasExtinf && hasTs && !hasStreamInf && !hasMap) return 'mono-hls';
-      return 'hls';
-    }
-
-    if (contentType.includes('mpd') || url.toLowerCase().endsWith('.mpd')) return 'dash';
-
-    // if this is a .m3u8 but content-type absent, read
-    const text = await r.text();
-    if (/^#EXTM3U/m.test(text)) {
-      const hasStreamInf = /#EXT-X-STREAM-INF/.test(text);
-      const hasExtinf = /#EXTINF/.test(text);
-      const hasTs = /\.ts\b/i.test(text);
-      const hasMap = /#EXT-X-MAP/.test(text);
-      if (hasExtinf && hasTs && !hasStreamInf && !hasMap) return 'mono-hls';
-      return 'hls';
-    }
-
-    // mp4-like
-    if (contentType.includes('video/mp4') || /\.mp4(\?|$)/i.test(url)) return 'mp4';
-
-    // fallback: try to detect DASH inside body
-    if (/^\s*<\?xml|\<MPD/i.test(text || '')) return 'dash';
-
-    return 'unknown';
-  } catch (err) {
-    clearTimeout(id);
-    // network error -> unknown
-    return 'unknown';
-  }
-}
-
-/* basic LL-HLS detection */
+/* quick probe for LL-HLS (optional) */
 async function detectLlHls(url: string) {
   try {
     const r = await fetch(url, { cache: 'no-store' });
     if (!r.ok) return false;
-    const t = await r.text();
-    return t.includes('#EXT-X-PART') || t.includes('#EXT-X-SERVER-CONTROL');
+    const txt = await r.text();
+    return txt.includes('#EXT-X-PART') || txt.includes('#EXT-X-SERVER-CONTROL');
   } catch { return false; }
 }
 
-/* --------------------------- VideoPlayer component --------------------------- */
+/* --------------------------- Component --------------------------- */
 
 const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, refreshStream }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const shakaPlayerRef = useRef<any>(null);
-  const hlsRef = useRef<any>(null);
 
-  // JW refs
-  const jwRef = useRef<any>(null);
-  const jwContainerRef = useRef<HTMLDivElement | null>(null);
-  const jwFailedRef = useRef<boolean>(false);
+  const hlsRef = useRef<any | null>(null);
+  const shakaRef = useRef<any | null>(null);
 
+  // state
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(1);
@@ -209,165 +150,240 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [quality, setQuality] = useState<string>('auto');
-  const [showSettings, setShowSettings] = useState(false);
   const [availableQualities, setAvailableQualities] = useState<string[]>(['auto']);
 
-  const controlsTimeoutRef = useRef<number | null>(null);
-  const signedRenewTimerRef = useRef<number | null>(null);
+  // recon/watchdog state (refs)
+  const lastFragTimeRef = useRef<number>(Date.now());
+  const fragWatchdogTimerRef = useRef<number | null>(null);
+  const reconnectAttemptsRef = useRef<number>(0);
+  const signedExpiryRef = useRef<number | null>(null);
+  const currentStreamRef = useRef<string | null>(null);
   const manifestPollRef = useRef<number | null>(null);
 
-  // stream state
-  const streamUrlRef = useRef<string | null>(null);
-  const streamExpiryRef = useRef<number | null>(null);
+  const controlsTimeoutRef = useRef<number | null>(null);
 
-  const loadJwScript = useCallback(() => loadScript('https://ssl.p.jwpcdn.com/player/v/8.38.10/jwplayer.js'), []);
+  // utility to create Hls instance
+  const createHls = useCallback((streamUrl: string) => {
+    const HlsLib = (window as any).Hls;
+    if (!HlsLib) return null;
 
-  const cleanupAll = useCallback(() => {
-    try { shakaPlayerRef.current?.destroy(); } catch {}
-    shakaPlayerRef.current = null;
-    try { hlsRef.current?.destroy(); } catch {}
-    hlsRef.current = null;
+    const lowEnd = (navigator as any).hardwareConcurrency <= 4 || (navigator as any).deviceMemory <= 2;
 
-    try { if (jwRef.current?.remove) jwRef.current.remove(); } catch {}
-    jwRef.current = null;
-    jwFailedRef.current = false;
+    const hls = new HlsLib({
+      enableWorker: false, // worker sometimes problematic with some IPTV servers
+      lowLatencyMode: false,
+      startLevel: -1,
+      maxBufferLength: lowEnd ? 40 : 30,
+      maxMaxBufferLength: lowEnd ? 60 : 90,
+      backBufferLength: 30,
+      maxBufferHole: 0.5,
+      fragLoadingTimeOut: 20000,
+      fragLoadingMaxRetry: 6,
+      manifestLoadingMaxRetry: 4,
+      levelLoadingMaxRetry: 4
+    });
 
-    try {
-      if (videoRef.current) {
-        videoRef.current.pause();
-        videoRef.current.removeAttribute('src');
-        videoRef.current.load();
-      }
-    } catch {}
-
-    try { if (manifestPollRef.current) { clearInterval(manifestPollRef.current); manifestPollRef.current = null; } } catch {}
-    try { if (signedRenewTimerRef.current) { clearTimeout(signedRenewTimerRef.current); signedRenewTimerRef.current = null; } } catch {}
-
-    setError(null);
-    setAvailableQualities(['auto']);
+    return hls;
   }, []);
 
-  /* ---------- JW loader (skippable for mono-hls) ---------- */
-  const tryLoadJW = useCallback(async (url: string, ch: Channel, skipIfMono = true) => {
-    if (jwFailedRef.current) return false;
-    // only attempt JW for some extensions/types
-    const accepted = ['m3u8', 'mp4', 'ts', 'direct'];
-    if (!(accepted.includes(ch.stream_type) || /\.(m3u8|mp4|ts)(\?|$)/i.test(url))) return false;
-    if (!jwContainerRef.current) return false;
+  /* ------------------- HLS loader + watchdog + reconnect ------------------- */
 
-    // optional: skip if mono-hls (we want HLS.js)
-    if (skipIfMono) {
+  const startFragWatchdog = useCallback((hls: any, streamUrl: string, ch: Channel) => {
+    // clear old
+    try { if (fragWatchdogTimerRef.current) { clearInterval(fragWatchdogTimerRef.current); fragWatchdogTimerRef.current = null; } } catch {}
+    lastFragTimeRef.current = Date.now();
+
+    const checkInterval = 5000; // check every 5s
+    const stallThreshold = 12_000; // if no fragments for 12s => consider stalled
+
+    fragWatchdogTimerRef.current = window.setInterval(async () => {
       try {
-        const p = await probeStream(url, 3000);
-        if (p === 'mono-hls') {
-          console.debug('tryLoadJW: detected mono-hls, skipping JW');
-          return false;
+        const now = Date.now();
+        const last = lastFragTimeRef.current;
+        const v = videoRef.current;
+        // only check if playing / loading live
+        if (!v) return;
+        const isStalled = (now - last) > stallThreshold && (!v.paused && !v.ended);
+        if (!isStalled) return;
+
+        console.warn('Fragment watchdog detected stall — attempting recovery', { streamUrl, lastDiff: now - last });
+
+        // try lightweight recover first
+        try { hls.recoverMediaError?.(); } catch (e) { console.warn('hls.recoverMediaError failed', e); }
+
+        // if too many attempts -> full reload (with backoff + backup proxy)
+        reconnectAttemptsRef.current = (reconnectAttemptsRef.current || 0) + 1;
+        const attempt = reconnectAttemptsRef.current;
+        const backoffMs = Math.min(30_000, 2000 * attempt);
+
+        if (attempt <= 2) {
+          // give it some time
+          await new Promise(r => setTimeout(r, backoffMs));
+          try { hls.startLoad?.(); } catch { try { hls.loadSource(streamUrl); hls.attachMedia(videoRef.current); } catch {} }
+          return;
+        }
+
+        // attempt full reload with backup proxy
+        try {
+          const backup = withBackupProxy(streamUrl);
+          try { hls.destroy(); } catch {}
+          hlsRef.current = createHls(streamUrl);
+          const h2 = hlsRef.current;
+          h2.loadSource(backup);
+          h2.attachMedia(videoRef.current);
+          // reset attempts on success
+          reconnectAttemptsRef.current = 0;
+        } catch (e) {
+          console.warn('Full HLS reload failed', e);
+        }
+      } catch (watchErr) {
+        console.warn('watchdog error', watchErr);
+      }
+    }, checkInterval) as unknown as number;
+  }, [createHls]);
+
+  const stopFragWatchdog = useCallback(() => {
+    try { if (fragWatchdogTimerRef.current) { clearInterval(fragWatchdogTimerRef.current); fragWatchdogTimerRef.current = null; } } catch {}
+    reconnectAttemptsRef.current = 0;
+  }, []);
+
+  const loadHLS = useCallback(async (video: HTMLVideoElement, ch: Channel, preferProxy = false) => {
+    // ensure Hls lib
+    if (!(window as any).Hls) {
+      await loadScript('https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.7/hls.min.js');
+    }
+    const HlsLib = (window as any).Hls;
+    if (!HlsLib || !HlsLib.isSupported()) {
+      // fallback to native
+      try {
+        video.src = ch.stream_url;
+        const resume = loadResumePosition(ch.id);
+        if (resume != null) video.currentTime = resume;
+        await video.play().catch(() => {});
+        return;
+      } catch (e) {
+        throw e;
+      }
+    }
+
+    // create hls
+    const hls = createHls(ch.stream_url);
+    if (!hls) throw new Error('Hls not available');
+    hlsRef.current = hls;
+    let triedBackup = false;
+    let streamUrl = ch.stream_url;
+
+    // if mustProxy -> force backup proxy used URL
+    if (preferProxy || mustProxy(streamUrl)) {
+      streamUrl = withBackupProxy(streamUrl);
+    }
+
+    // attach events
+    hls.on(HlsLib.Events.MANIFEST_PARSED, (_: any, data: any) => {
+      try {
+        const quals = (data?.levels || []).map((l: any) => (l.height ? `${l.height}p` : `${Math.round((l?.bitrate || 0) / 1000)}kbps`));
+        setAvailableQualities(['auto', ...Array.from(new Set(quals))]);
+      } catch {}
+      // attempt to set resumePosition if present
+      try {
+        const resume = loadResumePosition(ch.id);
+        if (resume != null) {
+          try { video.currentTime = resume; } catch {}
         }
       } catch {}
-    }
+      video.play().catch(() => {});
+    });
 
-    try {
-      await loadJwScript();
-    } catch (e) {
-      jwFailedRef.current = true;
-      return false;
-    }
+    // update lastFragTime on fragment events
+    const markFragment = () => { lastFragTimeRef.current = Date.now(); reconnectAttemptsRef.current = 0; };
+    hls.on(HlsLib.Events.FRAG_LOADED, markFragment);
+    hls.on(HlsLib.Events.FRAG_BUFFERED, markFragment);
+    hls.on(HlsLib.Events.FRAG_PARSING_METADATA, markFragment);
+    hls.on(HlsLib.Events.FRAG_PARSED, markFragment);
 
-    try {
-      jwContainerRef.current.style.display = 'block';
-      const final = mustProxy(url) ? withBackupProxy(url) : url;
+    hls.on(HlsLib.Events.ERROR, async (_: any, data: any) => {
+      console.warn('HLS error event', data);
+      // recover non-fatal
+      if (!data) return;
+      if (!data.fatal) {
+        try { hls.recoverMediaError?.(); } catch {}
+        return;
+      }
 
+      // fatal errors: try a controlled recovery flow
+      // 1) try recoverMediaError()
+      // 2) if that fails, try reload source
+      // 3) if that fails, try backup proxy
       try {
-        jwRef.current = (window as any).jwplayer(jwContainerRef.current).setup({
-          file: final,
-          autostart: true,
-          width: '100%',
-          height: '100%',
-          mute: false,
-          preload: 'auto',
-          stretching: 'uniform',
-        });
-      } catch (e) {
-        try {
-          jwRef.current = (window as any).jwplayer(jwContainerRef.current);
-          jwRef.current.setup && jwRef.current.setup({ file: final, autostart: true });
-        } catch (err) {
-          jwFailedRef.current = true;
-          jwContainerRef.current.style.display = 'none';
-          return false;
+        try { hls.recoverMediaError?.(); } catch (e) { /* ignore */ }
+
+        // if network error or other fatal, reload or use backup on second attempt
+        reconnectAttemptsRef.current = (reconnectAttemptsRef.current || 0) + 1;
+        const attempt = reconnectAttemptsRef.current;
+        if (attempt <= 2) {
+          try {
+            hls.startLoad?.();
+            return;
+          } catch {}
         }
+
+        if (!triedBackup) {
+          triedBackup = true;
+          try {
+            hls.destroy();
+          } catch {}
+          const backup = withBackupProxy(ch.stream_url);
+          hlsRef.current = createHls(backup);
+          hlsRef.current.loadSource(backup);
+          hlsRef.current.attachMedia(video);
+          startFragWatchdog(hlsRef.current, backup, ch);
+          return;
+        }
+
+        // if still fatal after backup, throw to upper handler
+        setError('Stream error occurred (HLS fatal)');
+      } catch (err) {
+        console.error('HLS fatal handling error', err);
+        setError('Stream error occurred');
       }
+    });
 
-      jwRef.current.on?.('ready', () => {
-        try {
-          const resume = loadResumePosition(ch.id);
-          if (resume != null && jwRef.current?.seek) {
-            try { jwRef.current.seek(resume); } catch {}
-          }
-        } catch {}
-        setIsLoading(false);
-        setIsPlaying(true);
-        try { if (videoRef.current) { videoRef.current.pause(); videoRef.current.removeAttribute('src'); videoRef.current.load(); } } catch {}
-      });
-
-      jwRef.current.on?.('play', () => setIsPlaying(true));
-      jwRef.current.on?.('pause', () => setIsPlaying(false));
-      jwRef.current.on?.('time', (t: any) => {
-        try { if (channel?.id) saveResumePosition(channel.id, Number(t?.position ?? 0)); } catch {}
-      });
-
-      jwRef.current.on?.('error', (err: any) => {
-        console.warn('JW error', err);
-        jwFailedRef.current = true;
-        try { jwRef.current.remove(); } catch {}
-        jwRef.current = null;
-        if (jwContainerRef.current) jwContainerRef.current.style.display = 'none';
-      });
-
-      // manifest polling for live masters (try to update candidate playlist)
-      if (/\.m3u8/i.test(url)) {
-        try {
-          const id = window.setInterval(async () => {
-            try {
-              const r = await fetch(url, { cache: 'no-store' });
-              if (!r.ok) return;
-              const t = await r.text();
-              const m = t.match(/https?:\/\/[^'"\s]+\.m3u8[^'"\s]*/i);
-              if (m?.[0]) {
-                const candidate = mustProxy(m[0]) ? withBackupProxy(m[0]) : m[0];
-                if (jwRef.current && typeof jwRef.current.load === 'function') {
-                  try { jwRef.current.load([{ file: candidate }]); } catch {}
-                }
-              }
-            } catch {}
-          }, 8000);
-          manifestPollRef.current = id as unknown as number;
-        } catch {}
+    // finally load & attach
+    try {
+      hls.loadSource(streamUrl);
+    } catch (e) {
+      // try backup proxy automatically
+      try {
+        const backup = withBackupProxy(ch.stream_url);
+        hls.loadSource(backup);
+        streamUrl = backup;
+      } catch (ee) {
+        throw ee;
       }
-
-      return true;
-    } catch (err) {
-      jwFailedRef.current = true;
-      try { if (jwContainerRef.current) jwContainerRef.current.style.display = 'none'; } catch {}
-      return false;
     }
-  }, [loadJwScript, channel]);
+    hls.attachMedia(video);
 
-  /* ---------------- Shaka (DASH/Widevine) ---------------- */
+    // start fragment watchdog
+    startFragWatchdog(hls, streamUrl, ch);
+  }, [createHls, startFragWatchdog]);
+
+  /* ------------------- MPD / Widevine via Shaka ------------------- */
   const loadMPD = useCallback(async (video: HTMLVideoElement, ch: Channel) => {
-    if (!(window as any).shaka) await loadScript('https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.7.11/shaka-player.compiled.min.js');
+    if (!(window as any).shaka) {
+      await loadScript('https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.7.11/shaka-player.compiled.min.js');
+    }
     const shakaLib = (window as any).shaka;
     shakaLib.polyfill.installAll();
-    if (!shakaLib.Player.isBrowserSupported()) throw new Error('Shaka not supported in this browser');
+    if (!shakaLib.Player.isBrowserSupported()) throw new Error('DASH not supported');
+
     const player = new shakaLib.Player(video);
-    shakaPlayerRef.current = player;
+    shakaRef.current = player;
 
     player.configure({
       streaming: { bufferingGoal: 10, rebufferingGoal: 2, bufferBehind: 30 },
-      abr: { enabled: true, defaultBandwidthEstimate: 4_000_000 }
+      abr: { enabled: true, defaultBandwidthEstimate: 5_000_000 }
     });
 
-    // ClearKey support if provided in channel (keep keys backward-compatible)
     if ((ch as any).clearkey_kid && (ch as any).clearkey_key) {
       player.configure({ drm: { clearKeys: { [(ch as any).clearkey_kid]: (ch as any).clearkey_key } } });
     }
@@ -385,117 +401,25 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
       } catch {}
     });
 
+    // try load mpd, fallback to proxy if needed
     try { await player.load(ch.stream_url); }
     catch {
-      await player.load(withBackupProxy(ch.stream_url));
+      try { await player.load(withBackupProxy(ch.stream_url)); }
+      catch (err) { throw err; }
     }
 
     const resume = loadResumePosition(ch.id);
-    if (resume != null) try { video.currentTime = resume; } catch {}
+    if (resume != null) video.currentTime = resume;
     await video.play();
   }, []);
 
-  /* ---------------- HLS loader ---------------- */
-  const loadHLS = useCallback(async (video: HTMLVideoElement, ch: Channel) => {
-    const streamUrl = ch.stream_url;
-    const resume = loadResumePosition(ch.id);
-
-    // prefer native HLS on Safari when not forced to proxy
-    if (!mustProxy(streamUrl) && video.canPlayType('application/vnd.apple.mpegurl')) {
-      try {
-        video.src = streamUrl;
-        if (resume != null) video.currentTime = resume;
-        await video.play();
-        return;
-      } catch {}
-    }
-
-    // load Hls.js
-    if (!(window as any).Hls) await loadScript('https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.7/hls.min.js');
-    const HlsLib = (window as any).Hls;
-    if (!HlsLib || !HlsLib.isSupported()) {
-      // fallback to native
-      video.src = streamUrl;
-      if (resume != null) video.currentTime = resume;
-      await video.play();
-      return;
-    }
-
-    const lowEnd = (navigator as any).hardwareConcurrency <= 4 || (navigator as any).deviceMemory <= 2;
-    const supportsLL = await detectLlHls(streamUrl);
-
-    // tuned HLS config for diverse IPTV sources
-    const hls = new HlsLib({
-      enableWorker: !lowEnd,
-      lowLatencyMode: supportsLL && !lowEnd,
-      startLevel: -1,
-      autoStartLoad: true,
-      backBufferLength: 30,
-      maxBufferLength: lowEnd ? 40 : 30,
-      maxBufferSize: lowEnd ? 60 * 1e6 : 90 * 1e6,
-      maxBufferHole: 0.5,
-      progressive: true, // important for TS-only streams
-      fragLoadingTimeOut: 20000,
-      fragLoadingMaxRetry: 6,
-    });
-    hlsRef.current = hls;
-
-    let triedBackup = false;
-
-    hls.loadSource(streamUrl);
-    hls.attachMedia(video);
-
-    hls.on(HlsLib.Events.MANIFEST_PARSED, (_: any, data: any) => {
-      try {
-        const quals = data.levels.map((l: any) => `${l.height}p`);
-        setAvailableQualities(['auto', ...quals]);
-      } catch {}
-      if (resume != null) {
-        try { video.currentTime = resume; } catch {}
-      }
-      video.play().catch(() => {});
-    });
-
-    hls.on(HlsLib.Events.ERROR, (_: any, data: any) => {
-      if (!data) return;
-      if (!data.fatal) {
-        try { hls.recoverMediaError(); } catch {}
-        return;
-      }
-      // fatal -> try backup proxy once
-      if (!triedBackup) {
-        triedBackup = true;
-        try { hls.destroy(); } catch {}
-        const backup = withBackupProxy(streamUrl);
-        const h2 = new HlsLib();
-        hlsRef.current = h2;
-        try { h2.loadSource(backup); h2.attachMedia(video); } catch {}
-        return;
-      }
-      setError('Stream error occurred');
-    });
-  }, []);
-
-  /* ---------------- Widevine helper (shaka) ---------------- */
-  const loadWidevine = useCallback(async (video: HTMLVideoElement, ch: Channel) => {
-    // if license url present, Shaka will handle license server config
-    if (!(window as any).shaka) await loadScript('https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.7.11/shaka-player.compiled.min.js');
-    const shakaLib = (window as any).shaka;
-    shakaLib.polyfill.installAll();
-    if (!shakaLib.Player.isBrowserSupported()) throw new Error('Browser not supported for Widevine');
-    const player = new shakaLib.Player(video);
-    shakaPlayerRef.current = player;
-    if (ch.license_url) {
-      player.configure({ drm: { servers: { 'com.widevine.alpha': ch.license_url } } });
-    }
-    await player.load(ch.stream_url);
-    await video.play();
-  }, []);
-
-  /* ---------------- main loader ---------------- */
+  /* --------------------------- main loader effect --------------------------- */
   useEffect(() => {
     if (!channel || !videoRef.current) {
-      cleanupAll();
+      // cleanup
+      try { hlsRef.current?.destroy(); } catch {}
+      try { shakaRef.current?.destroy(); } catch {}
+      stopFragWatchdog();
       return;
     }
 
@@ -503,89 +427,78 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
     setIsLoading(true);
     setError(null);
     setAvailableQualities(['auto']);
-    streamUrlRef.current = channel.stream_url;
+    currentStreamRef.current = channel.stream_url;
 
     (async () => {
-      cleanupAll();
-      const v = videoRef.current!;
-      let url = channel.stream_url;
+      // cleanup first
+      try { hlsRef.current?.destroy(); } catch {}
+      try { shakaRef.current?.destroy(); } catch {}
+      stopFragWatchdog();
 
-      // allow refreshStream to provide signed / renewed url
+      const video = videoRef.current!;
+      let streamUrl = channel.stream_url;
+
+      // allow refreshStream hook to return signed URL
       if (refreshStream) {
         try {
-          const newData = await refreshStream(url);
-          if (newData?.url) {
-            url = newData.url;
-            streamUrlRef.current = newData.url;
-            if (newData.expiresAt) streamExpiryRef.current = newData.expiresAt;
+          const res = await refreshStream(streamUrl);
+          if (res?.url) {
+            streamUrl = res.url;
+            if (res.expiresAt) signedExpiryRef.current = res.expiresAt;
+            currentStreamRef.current = streamUrl;
           }
         } catch (e) {
-          console.warn('refreshStream error', e);
+          console.warn('refreshStream failed', e);
         }
       }
 
-      // probe stream to figure out flavor
-      let probeType: 'mono-hls' | 'hls' | 'dash' | 'mp4' | 'unknown' = 'unknown';
-      try { probeType = await probeStream(url, 3000); } catch {}
-
-      // JW attempt (skip for mono-hls, unknown may still try depending on extension)
+      // choose engine by extension/type
       try {
-        const skipMono = true;
-        const jwOk = await tryLoadJW(url, channel, skipMono);
-        if (jwOk) {
+        // MPD / DASH / Widevine
+        if (channel.stream_type === 'mpd' || /\.mpd(\?|$)/i.test(streamUrl)) {
+          await loadMPD(video, { ...channel, stream_url: streamUrl } as Channel);
+          setIsPlaying(true);
           setIsLoading(false);
           return;
         }
-      } catch (e) {
-        console.warn('JW attempt failed', e);
-      }
 
-      // choose engine based on probe
-      try {
-        if (channel.stream_type === 'mpd' || probeType === 'dash' || channel.stream_type === 'widevine') {
-          // MPD / DASH (Shaka)
-          await loadMPD(v, { ...channel, stream_url: url } as Channel);
-        } else if (channel.stream_type === 'm3u8' || probeType === 'hls' || probeType === 'mono-hls' || /\.m3u8(\?|$)/i.test(url)) {
-          // HLS path - we prefer Hls.js for many iptv streams because it handles raw TS
-          // If probe said mono-hls, force Hls.js (do not use JW)
-          await loadHLS(v, { ...channel, stream_url: url } as Channel);
-        } else if (/\.(mp4|m3u8|ts)$/i.test(url) || channel.stream_type === 'mp4' || channel.stream_type === 'ts' || channel.stream_type === 'direct') {
-          // direct/MP4/TS - native playback
-          v.src = url;
-          try {
-            const resume = loadResumePosition(channel.id);
-            if (resume != null) v.currentTime = resume;
-          } catch {}
-          await v.play();
-        } else if (channel.stream_type === 'youtube') {
-          // youtube is handled outside (render iframe) - nothing to do here
-        } else {
-          // unknown: try HLS.js first (IPTV case), then fallback to native
-          try {
-            await loadHLS(v, { ...channel, stream_url: url } as Channel);
-          } catch (e) {
-            // fallback native
-            v.src = url;
-            try {
-              const resume = loadResumePosition(channel.id);
-              if (resume != null) v.currentTime = resume;
-            } catch {}
-            await v.play();
-          }
+        // HLS (.m3u8) -> enforce HLS.js usage (NO JW)
+        if (channel.stream_type === 'm3u8' || /\.m3u8(\?|$)/i.test(streamUrl)) {
+          await loadHLS(video, { ...channel, stream_url: streamUrl } as Channel);
+          setIsPlaying(true);
+          setIsLoading(false);
+          return;
         }
-        setIsPlaying(true);
-        setIsLoading(false);
-      } catch (err: any) {
-        console.error('Player load error:', err);
-        // last resort: try backup proxy for HLS / native
+
+        // fallback: direct/native (mp4/ts/direct)
         try {
-          if (url && !url.startsWith(BACKUP_PROXY)) {
-            const proxy = withBackupProxy(url);
-            if (channel.stream_type === 'm3u8' || /\.m3u8/i.test(url)) {
-              try { await loadHLS(v, { ...channel, stream_url: proxy } as Channel); setIsLoading(false); return; } catch {}
-            } else {
-              try { v.src = proxy; await v.play(); setIsLoading(false); return; } catch {}
-            }
+          video.src = streamUrl;
+          const resume = loadResumePosition(channel.id);
+          if (resume != null) video.currentTime = resume;
+          await video.play().catch(() => {});
+          setIsPlaying(true);
+          setIsLoading(false);
+          return;
+        } catch (err) {
+          // try backup proxy for fallback
+          const backup = withBackupProxy(streamUrl);
+          video.src = backup;
+          await video.play().catch(() => {});
+          setIsPlaying(true);
+          setIsLoading(false);
+          return;
+        }
+      } catch (err: any) {
+        console.error('Main loader error', err);
+        // final attempt: if HLS failed and we haven't tried backup proxy -> try it
+        try {
+          if ((channel.stream_type === 'm3u8' || /\.m3u8(\?|$)/i.test(streamUrl)) && !streamUrl.startsWith(BACKUP_PROXY)) {
+            try {
+              await loadHLS(video, { ...channel, stream_url: withBackupProxy(streamUrl) } as Channel, true);
+              setIsPlaying(true);
+              setIsLoading(false);
+              return;
+            } catch (e) { /* fall-through */ }
           }
         } catch {}
         setError(err?.message || 'Failed to load channel');
@@ -595,44 +508,47 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
 
     return () => {
       cancelled = true;
-      cleanupAll();
+      try { hlsRef.current?.destroy(); } catch {}
+      try { shakaRef.current?.destroy(); } catch {}
+      stopFragWatchdog();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [channel, refreshStream]);
+  }, [channel, loadHLS, loadMPD, loadWidevine, refreshStream]);
 
-  /* ---------------- signed stream renewal scheduling ---------------- */
+  /* Signed URL renewal (if refreshStream provided and expiresAt set) */
   useEffect(() => {
     if (!channel || !refreshStream) return;
     let mounted = true;
+    let timerId: number | null = null;
 
     const scheduleRenew = () => {
-      try { if (signedRenewTimerRef.current) { clearTimeout(signedRenewTimerRef.current); signedRenewTimerRef.current = null; } } catch {}
-      const expiresAt = streamExpiryRef.current;
+      try { if (timerId) clearTimeout(timerId); } catch {}
+      const expiresAt = signedExpiryRef.current;
       const lead = 30_000;
       const fallback = 4 * 60 * 1000;
-
       const doRenew = async () => {
         if (!mounted) return;
         try {
-          const newData = await refreshStream(streamUrlRef.current ?? channel.stream_url);
+          const newData = await refreshStream(currentStreamRef.current ?? channel.stream_url);
           if (newData?.url) {
-            streamUrlRef.current = newData.url;
-            if (newData.expiresAt) streamExpiryRef.current = newData.expiresAt;
-            // attempt to swap into active engine
+            currentStreamRef.current = newData.url;
+            if (newData.expiresAt) signedExpiryRef.current = newData.expiresAt;
+            // swap into active engine if possible
             try {
-              if (jwRef.current && typeof jwRef.current.load === 'function') {
-                jwRef.current.load([{ file: newData.url }]);
+              if (hlsRef.current && typeof hlsRef.current.loadSource === 'function') {
+                hlsRef.current.stopLoad?.();
+                hlsRef.current.loadSource(newData.url);
+                hlsRef.current.startLoad?.();
                 return;
               }
             } catch {}
             try {
-              const HlsLib = (window as any).Hls;
-              if (hlsRef.current && HlsLib && typeof hlsRef.current.loadSource === 'function') {
-                try { hlsRef.current.stopLoad?.(); } catch {}
-                try { hlsRef.current.loadSource(newData.url); hlsRef.current.startLoad?.(); } catch {}
+              if (shakaRef.current && typeof shakaRef.current.load === 'function') {
+                shakaRef.current.load(newData.url);
                 return;
               }
             } catch {}
+            // fallback native
             try {
               const v = videoRef.current;
               if (v) {
@@ -643,15 +559,15 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
             } catch {}
           }
         } catch (err) {
-          console.warn('renew failed', err);
+          console.warn('Signed stream renew failed', err);
         }
       };
 
       if (expiresAt && expiresAt - Date.now() > 1000) {
         const delay = Math.max(0, (expiresAt - Date.now()) - lead);
-        signedRenewTimerRef.current = window.setTimeout(async () => { await doRenew(); scheduleRenew(); }, delay) as unknown as number;
+        timerId = window.setTimeout(async () => { await doRenew(); scheduleRenew(); }, delay) as unknown as number;
       } else {
-        signedRenewTimerRef.current = window.setTimeout(async () => { await doRenew(); scheduleRenew(); }, fallback) as unknown as number;
+        timerId = window.setTimeout(async () => { await doRenew(); scheduleRenew(); }, fallback) as unknown as number;
       }
     };
 
@@ -659,11 +575,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
 
     return () => {
       mounted = false;
-      try { if (signedRenewTimerRef.current) { clearTimeout(signedRenewTimerRef.current); signedRenewTimerRef.current = null; } } catch {}
+      try { if (timerId) clearTimeout(timerId); } catch {}
     };
   }, [channel, refreshStream]);
 
-  /* ---------------- native events and resume saving ---------------- */
+  /* native video events + resume saving */
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
@@ -697,7 +613,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
     };
   }, [channel]);
 
-  /* ---------------- controls / keyboard / misc ---------------- */
+  /* controls visibility */
   const showControlsTemporarily = useCallback(() => {
     setShowControls(true);
     try { if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current); } catch {}
@@ -706,74 +622,54 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
     }, 3000) as unknown as number;
   }, [isPlaying]);
 
+  /* fullscreen */
   useEffect(() => {
-    const onFull = () => setIsFullscreen(!!document.fullscreenElement);
-    document.addEventListener('fullscreenchange', onFull);
-    return () => document.removeEventListener('fullscreenchange', onFull);
+    const onF = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onF);
+    return () => document.removeEventListener('fullscreenchange', onF);
   }, []);
 
+  /* control handlers */
   const togglePlay = useCallback(() => {
-    if (jwRef.current && jwRef.current.getState) {
-      try {
-        const st = jwRef.current.getState();
-        if (st === 'playing') jwRef.current.pause();
-        else jwRef.current.play();
-      } catch {}
-      return;
-    }
-    if (!videoRef.current) return;
-    if (isPlaying) videoRef.current.pause();
-    else videoRef.current.play().catch(() => {});
+    const v = videoRef.current;
+    if (!v) return;
+    if (isPlaying) v.pause(); else v.play().catch(() => {});
   }, [isPlaying]);
 
   const toggleMute = useCallback(() => {
-    if (jwRef.current && typeof jwRef.current.setVolume === 'function') {
-      try {
-        const nm = !isMuted;
-        jwRef.current.setVolume(nm ? 0 : Math.round((volume || 1) * 100));
-        setIsMuted(nm);
-      } catch {}
-      return;
-    }
-    if (!videoRef.current) return;
-    videoRef.current.muted = !isMuted;
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = !isMuted;
     setIsMuted(!isMuted);
-  }, [isMuted, volume]);
+  }, [isMuted]);
 
   const handleVolumeChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const newV = Number(e.target.value);
-    setVolume(newV);
-    if (jwRef.current && typeof jwRef.current.setVolume === 'function') {
-      try { jwRef.current.setVolume(Math.round(newV * 100)); } catch {}
-      setIsMuted(newV === 0);
-      return;
-    }
-    if (videoRef.current) {
-      videoRef.current.volume = newV;
-      setIsMuted(newV === 0);
-    }
+    const nv = Number(e.target.value);
+    setVolume(nv);
+    const v = videoRef.current;
+    if (v) { v.volume = nv; setIsMuted(nv === 0); }
+    // HLS-level volume isn't required because we drive native media element
   }, []);
 
   const toggleFullscreen = useCallback(() => {
     if (!containerRef.current) return;
-    if (!document.fullscreenElement) containerRef.current.requestFullscreen().catch(() => {});
-    else document.exitFullscreen().catch(() => {});
+    if (!document.fullscreenElement) {
+      containerRef.current.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen().catch(() => {});
+    }
   }, []);
 
   const handleSeek = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const t = Number(e.target.value);
-    if (jwRef.current && typeof jwRef.current.seek === 'function') {
-      try { jwRef.current.seek(t); setCurrentTime(t); } catch {}
-      return;
-    }
-    if (videoRef.current) {
-      videoRef.current.currentTime = t;
-      setCurrentTime(t);
-    }
+    const v = videoRef.current;
+    if (!v) return;
+    v.currentTime = t;
+    setCurrentTime(t);
   }, []);
 
   const formatTime = (time: number) => {
-    if (!isFinite(time)) return '00:00';
+    if (!isFinite(time) || time <= 0) return '00:00';
     const m = Math.floor(time / 60);
     const s = Math.floor(time % 60);
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
@@ -781,45 +677,45 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
 
   const handleQualityChange = (q: string) => {
     setQuality(q);
-    setShowSettings(false);
+    // set HLS level or Shaka track
     try {
-      if (hlsRef.current && q !== 'auto') {
-        const idx = hlsRef.current.levels.findIndex((l: any) => `${l.height}p` === q);
-        if (idx !== -1) hlsRef.current.currentLevel = idx;
-      } else if (hlsRef.current) hlsRef.current.currentLevel = -1;
+      if (hlsRef.current) {
+        if (q === 'auto') hlsRef.current.currentLevel = -1;
+        else {
+          const idx = hlsRef.current.levels.findIndex((l: any) => `${l.height}p` === q);
+          if (idx !== -1) hlsRef.current.currentLevel = idx;
+        }
+      }
     } catch {}
     try {
-      if (shakaPlayerRef.current) {
-        const tracks = shakaPlayerRef.current.getVariantTracks();
-        if (q === 'auto') shakaPlayerRef.current.configure({ abr: { enabled: true } });
+      if (shakaRef.current) {
+        if (q === 'auto') shakaRef.current.configure({ abr: { enabled: true } });
         else {
-          const track = tracks.find((t: any) => `${t.height}p` === q);
-          if (track) {
-            shakaPlayerRef.current.configure({ abr: { enabled: false } });
-            shakaPlayerRef.current.selectVariantTrack(track, true);
-          }
+          const tracks = shakaRef.current.getVariantTracks();
+          const t = tracks.find((tr: any) => `${tr.height}p` === q);
+          if (t) { shakaRef.current.configure({ abr: { enabled: false } }); shakaRef.current.selectVariantTrack(t, true); }
         }
       }
     } catch {}
   };
 
-  // YouTube embed handling: keep this outside the main loaders
+  /* render */
   if (channel?.stream_type === 'youtube') {
-    const id = channel.stream_url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)([^"&?/ ]{11})/)?.[1];
-    if (!id) return <div className="w-full h-full flex items-center justify-center bg-black text-red-500">Invalid YouTube</div>;
+    const videoId = channel.stream_url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)([^"&?/ ]{11})/)?.[1];
+    if (!videoId) return <div className="w-full h-full flex items-center justify-center bg-black text-red-500 font-mono">INVALID YOUTUBE URL</div>;
+    const origin = typeof window !== 'undefined' ? window.location.origin : '';
     return (
-      <div ref={containerRef} className="relative w-full aspect-video bg-black rounded-lg overflow-hidden">
-        <iframe className="w-full h-full" src={`https://www.youtube.com/embed/${id}?autoplay=1&rel=0`} frameBorder="0" allow="autoplay; encrypted-media" allowFullScreen />
+      <div ref={containerRef} className="relative w-full aspect-video bg-black rounded-lg overflow-hidden" style={{ boxShadow: '0 0 30px rgba(0,0,0,0.8)', border: '4px solid #5d4037' }}>
+        <iframe className="w-full h-full" src={`https://www.youtube.com/embed/${videoId}?autoplay=1&mute=1&playsinline=1&origin=${encodeURIComponent(origin)}`} frameBorder="0" allow="autoplay; encrypted-media" allowFullScreen />
       </div>
     );
   }
 
-  /* --------------------------- UI Render (kept close to your original) --------------------------- */
   return (
     <div
       ref={containerRef}
       className="relative w-full aspect-video bg-black rounded-lg overflow-hidden group"
-      onMouseMove={() => showControlsTemporarily()}
+      onMouseMove={showControlsTemporarily}
       onMouseLeave={() => isPlaying && setShowControls(false)}
       style={{
         boxShadow: '0 0 30px rgba(0,0,0,0.8), inset 0 0 60px rgba(139, 69, 19, 0.3)',
@@ -829,11 +725,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
         backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px'
       }}
     >
-      {/* JW container */}
-      <div ref={(el) => { if (el && !jwContainerRef.current) jwContainerRef.current = el; }} style={{ position: 'absolute', inset: 0, display: 'none', zIndex: 10 }} />
-
-      {/* native video */}
-      <video ref={videoRef} className="w-full h-full object-contain" playsInline onClick={() => togglePlay()} />
+      <video
+        ref={videoRef}
+        className="w-full h-full object-contain"
+        playsInline
+        onClick={togglePlay}
+      />
 
       {!channel && <StaticNoise />}
 
@@ -848,7 +745,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
         </div>
       )}
 
-      {/* decorative corners */}
+      {/* corners */}
       <div className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-amber-800 rounded-tl-lg" />
       <div className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-amber-800 rounded-tr-lg" />
       <div className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-amber-800 rounded-bl-lg" />
@@ -856,10 +753,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
 
       {/* controls overlay */}
       {channel && (
-        <div className={`absolute inset-x-0 bottom-0 transition-all duration-300 ${showControls ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4'}`} style={{ background: 'linear-gradient(to top, rgba(62, 39, 35, 0.95), rgba(62, 39, 35, 0.7), transparent)', borderTop: '2px solid #8d6e63' }}>
+        <div className={`absolute inset-x-0 bottom-0 transition-all duration-300 ${showControls ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4'}`}
+          style={{ background: 'linear-gradient(to top, rgba(62,39,35,0.95), rgba(62,39,35,0.7), transparent)', borderTop: '2px solid #8d6e63' }}>
+          {/* progress */}
           {duration > 0 && (
             <div className="px-4 pt-2">
-              <input type="range" min={0} max={duration} value={currentTime} onChange={handleSeek} className="w-full h-1 appearance-none cursor-pointer rounded-full" style={{ background: `linear-gradient(to right, #fbbf24 0%, #fbbf24 ${(currentTime / duration) * 100}%, #5d4037 ${(currentTime / duration) * 100}%, #5d4037 100%)` }} />
+              <input type="range" min={0} max={duration} value={currentTime} onChange={handleSeek}
+                className="w-full h-1 appearance-none cursor-pointer rounded-full"
+                style={{
+                  background: `linear-gradient(to right, #fbbf24 0%, #fbbf24 ${(currentTime / Math.max(1, duration)) * 100}%, #5d4037 ${(currentTime / Math.max(1, duration)) * 100}%, #5d4037 100%)`
+                }} />
             </div>
           )}
 
@@ -885,7 +788,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
                 <button onClick={toggleMute} className="p-2 text-amber-200 hover:text-amber-400 transition-colors">
                   {isMuted || volume === 0 ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
                 </button>
-                <input type="range" min={0} max={1} step={0.1} value={isMuted ? 0 : volume} onChange={handleVolumeChange} className="w-16 md:w-24 h-1 appearance-none cursor-pointer rounded-full hidden sm:block" style={{ background: `linear-gradient(to right, #fbbf24 0%, #fbbf24 ${(isMuted ? 0 : volume) * 100}%, #5d4037 ${(isMuted ? 0 : volume) * 100}%, #5d4037 100%)` }} />
+                <input type="range" min={0} max={1} step={0.05} value={isMuted ? 0 : volume}
+                  onChange={handleVolumeChange} className="w-16 md:w-24 h-1 appearance-none cursor-pointer rounded-full hidden sm:block"
+                  style={{ background: `linear-gradient(to right, #fbbf24 0%, #fbbf24 ${(isMuted ? 0 : volume) * 100}%, #5d4037 ${(isMuted ? 0 : volume) * 100}%, #5d4037 100%)` }} />
               </div>
 
               <span className="text-amber-200 text-xs md:text-sm font-mono hidden sm:block">
@@ -895,19 +800,18 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
 
             <div className="flex items-center gap-2">
               <div className="relative">
-                <button onClick={() => setShowSettings(!showSettings)} className="p-2 text-amber-200 hover:text-amber-400 transition-colors">
+                <button onClick={() => {/* show quality popup handled below */}} className="p-2 text-amber-200 hover:text-amber-400 transition-colors">
                   <Settings className="w-5 h-5" />
                 </button>
-                {showSettings && (
-                  <div className="absolute bottom-full right-0 mb-2 bg-amber-900/95 rounded-lg shadow-xl border border-amber-700 overflow-hidden min-w-[120px]">
-                    <div className="px-3 py-2 border-b border-amber-700 text-amber-200 text-xs font-medium">Quality</div>
-                    {availableQualities.map((q) => (
-                      <button key={q} onClick={() => handleQualityChange(q)} className={`w-full px-3 py-2 text-left text-sm transition-colors ${quality === q ? 'bg-amber-600 text-white' : 'text-amber-200 hover:bg-amber-800'}`}>
-                        {q}
-                      </button>
-                    ))}
-                  </div>
-                )}
+                {/* quality menu (simple) */}
+                <div className="absolute bottom-full right-0 mb-2 bg-amber-900/95 rounded-lg shadow-xl border border-amber-700 overflow-hidden min-w-[120px]">
+                  <div className="px-3 py-2 border-b border-amber-700 text-amber-200 text-xs font-medium">Quality</div>
+                  {availableQualities.map((q) => (
+                    <button key={q} onClick={() => handleQualityChange(q)} className={`w-full px-3 py-2 text-left text-sm ${quality === q ? 'bg-amber-600 text-white' : 'text-amber-200 hover:bg-amber-800'}`}>
+                      {q}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <button onClick={toggleFullscreen} className="p-2 text-amber-200 hover:text-amber-400 transition-colors">
@@ -918,7 +822,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
         </div>
       )}
 
-      {/* channel info */}
       {channel && showControls && (
         <div className="absolute top-4 left-4 bg-amber-900/80 px-3 py-1 rounded-lg">
           <p className="text-amber-100 text-sm font-medium">{channel.name}</p>
@@ -928,13 +831,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange, ref
   );
 };
 
-/* global window types */
+/* global types */
 declare global {
-  interface Window {
-    shaka: any;
-    Hls: any;
-    jwplayer?: any;
-  }
+  interface Window { shaka: any; Hls: any; }
 }
 
 export default VideoPlayer;
