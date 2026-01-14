@@ -92,11 +92,73 @@ const StaticNoise: React.FC = () => {
   );
 };
 
+/* ---------------------------
+   Playback helpers & config
+   --------------------------- */
+
+const BACKUP_PROXY = "https://poohlover.serv00.net";
+const FORCE_PROXY_HOSTS = [
+  "fl1.moveonjoy.com",
+  "linear-1147.frequency.stream",
+  "origin.thetvapp.to",
+];
+
+const withBackupProxy = (url: string) =>
+  url.startsWith(BACKUP_PROXY) ? url : `${BACKUP_PROXY}/${url}`;
+
+const mustProxy = (url: string) => {
+  try {
+    return FORCE_PROXY_HOSTS.includes(new URL(url).host);
+  } catch {
+    return false;
+  }
+};
+
+const RESUME_KEY_PREFIX = "ptv:resume:";
+const RESUME_TTL = 7 * 24 * 60 * 60 * 1000;
+function saveResumePosition(channelId: string, position: number) {
+  try {
+    const payload = { pos: position, ts: Date.now() };
+    localStorage.setItem(`${RESUME_KEY_PREFIX}${channelId}`, JSON.stringify(payload));
+  } catch {}
+}
+function loadResumePosition(channelId: string): number | null {
+  try {
+    const raw = localStorage.getItem(`${RESUME_KEY_PREFIX}${channelId}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.pos !== "number" || typeof parsed.ts !== "number") return null;
+    if (Date.now() - parsed.ts > RESUME_TTL) {
+      localStorage.removeItem(`${RESUME_KEY_PREFIX}${channelId}`);
+      return null;
+    }
+    return parsed.pos;
+  } catch {
+    return null;
+  }
+}
+
+const loadJwScript = () =>
+  new Promise<void>((resolve, reject) => {
+    if ((window as any).jwplayer) return resolve();
+    const s = document.createElement("script");
+    s.src = "https://ssl.p.jwpcdn.com/player/v/8.38.10/jwplayer.js";
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+
 const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const shakaPlayerRef = useRef<any>(null);
   const hlsRef = useRef<any>(null);
+
+  // JW refs
+  const jwRef = useRef<any>(null);
+  const jwContainerRef = useRef<HTMLDivElement | null>(null);
+  const jwFailedRef = useRef<boolean>(false);
   
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
@@ -113,7 +175,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
   const controlsTimeoutRef = useRef<NodeJS.Timeout>();
 
-  // Load Shaka Player and HLS.js dynamically
+  // Load Shaka Player and HLS.js dynamically (keeps same behavior)
   useEffect(() => {
     const loadScripts = async () => {
       // Load Shaka Player
@@ -122,7 +184,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
         shakaScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.7.11/shaka-player.compiled.min.js';
         shakaScript.async = true;
         document.head.appendChild(shakaScript);
-        await new Promise(resolve => shakaScript.onload = resolve);
+        await new Promise(resolve => shakaScript.onload = resolve).catch(()=>{});
       }
 
       // Load HLS.js
@@ -131,29 +193,114 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
         hlsScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.7/hls.min.js';
         hlsScript.async = true;
         document.head.appendChild(hlsScript);
-        await new Promise(resolve => hlsScript.onload = resolve);
+        await new Promise(resolve => hlsScript.onload = resolve).catch(()=>{});
       }
     };
 
     loadScripts();
   }, []);
 
-  // Cleanup function
+  // Cleanup function - extended to include JW cleanup
   const cleanup = useCallback(() => {
     if (shakaPlayerRef.current) {
-      shakaPlayerRef.current.destroy();
+      try { shakaPlayerRef.current.destroy(); } catch {}
       shakaPlayerRef.current = null;
     }
     if (hlsRef.current) {
-      hlsRef.current.destroy();
+      try { hlsRef.current.destroy(); } catch {}
       hlsRef.current = null;
     }
+    if (jwRef.current) {
+      try { jwRef.current.remove(); } catch {}
+      jwRef.current = null;
+    }
+    if (jwContainerRef.current) {
+      try { jwContainerRef.current.style.display = 'none'; } catch {}
+    }
+    jwFailedRef.current = false;
+
     if (videoRef.current) {
-      videoRef.current.src = '';
-      videoRef.current.load();
+      try {
+        videoRef.current.src = '';
+        videoRef.current.load();
+      } catch {}
     }
     setError(null);
     setAvailableQualities(['auto']);
+  }, []);
+
+  // Try load JW Player for HLS/MP4/direct types
+  const tryLoadJW = useCallback(async (streamUrl: string, ch: Channel) => {
+    if (jwFailedRef.current) return false;
+    // only attempt JW for m3u8/mp4/direct/ts types (not mpd/widevine)
+    const tryFor = ['m3u8','mp4','ts','direct'];
+    if (!(tryFor.includes(ch.stream_type) || /(\.m3u8|\.mp4|\.ts)(\?|$)/i.test(streamUrl))) return false;
+
+    if (!jwContainerRef.current) return false;
+    try {
+      await loadJwScript();
+    } catch (e) {
+      jwFailedRef.current = true;
+      return false;
+    }
+
+    try {
+      jwContainerRef.current.style.display = 'block';
+      const proxied = mustProxy(streamUrl) ? withBackupProxy(streamUrl) : streamUrl;
+
+      // create/setup jwplayer
+      try {
+        jwRef.current = (window as any).jwplayer(jwContainerRef.current).setup({
+          file: proxied,
+          autostart: true,
+          mute: false,
+          preload: "auto",
+          width: "100%",
+          height: "100%",
+          stretching: "uniform",
+        });
+      } catch (e) {
+        // some jw versions require call form
+        try {
+          jwRef.current = (window as any).jwplayer(jwContainerRef.current);
+          jwRef.current.setup && jwRef.current.setup({ file: proxied, autostart: true });
+        } catch (err) {
+          jwFailedRef.current = true;
+          jwContainerRef.current.style.display = 'none';
+          return false;
+        }
+      }
+
+      jwRef.current.on?.("ready", () => {
+        try {
+          const resume = loadResumePosition(ch.id);
+          if (resume != null && jwRef.current?.seek) {
+            try { jwRef.current.seek(resume); } catch {}
+          }
+        } catch {}
+        setIsLoading(false);
+        setIsPlaying(true);
+        // ensure native video unloaded
+        try { if (videoRef.current) { videoRef.current.pause(); videoRef.current.removeAttribute('src'); videoRef.current.load(); } } catch {}
+      });
+
+      jwRef.current.on?.("play", () => setIsPlaying(true));
+      jwRef.current.on?.("pause", () => setIsPlaying(false));
+      jwRef.current.on?.("error", (err: any) => {
+        console.warn('JW error', err);
+        jwFailedRef.current = true;
+        try { jwRef.current.remove(); } catch {}
+        jwRef.current = null;
+        if (jwContainerRef.current) jwContainerRef.current.style.display = 'none';
+      });
+
+      return true;
+    } catch (err) {
+      jwFailedRef.current = true;
+      try { if (jwContainerRef.current) jwContainerRef.current.style.display = 'none'; } catch {}
+      return false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Load channel
@@ -171,6 +318,18 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       const video = videoRef.current!;
 
       try {
+        // Try JW first for non-MPD/Widevine streams (HLS/MP4/direct/ts)
+        try {
+          const triedJw = await tryLoadJW(channel.stream_url, channel);
+          if (triedJw) {
+            // JW will handle playback; we return early
+            setIsLoading(false);
+            return;
+          }
+        } catch (e) {
+          // continue to other loaders
+        }
+
         switch (channel.stream_type) {
           case 'mpd':
             await loadMPD(video, channel);
@@ -188,14 +347,20 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
           case 'ts':
           case 'direct':
           default:
+            // direct native playback
             video.src = channel.stream_url;
+            // attempt resume
+            try {
+              const resume = loadResumePosition(channel.id);
+              if (resume != null) video.currentTime = resume;
+            } catch {}
             await video.play();
             break;
         }
         setIsPlaying(true);
       } catch (err: any) {
         console.error('Error loading channel:', err);
-        setError(err.message || 'Failed to load channel');
+        setError(err?.message || 'Failed to load channel');
       } finally {
         setIsLoading(false);
       }
@@ -204,7 +369,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     loadChannel();
 
     return cleanup;
-  }, [channel, cleanup]);
+  }, [channel, cleanup, tryLoadJW]);
 
   // Load MPD with ClearKey
   const loadMPD = async (video: HTMLVideoElement, ch: Channel) => {
@@ -252,44 +417,96 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       setAvailableQualities(['auto', ...qualities]);
     });
 
-    await player.load(ch.stream_url);
+    try {
+      await player.load(ch.stream_url);
+    } catch {
+      // try backup proxy
+      await player.load(withBackupProxy(ch.stream_url));
+    }
+
+    try {
+      const resume = loadResumePosition(ch.id);
+      if (resume != null) video.currentTime = resume;
+    } catch {}
+
     await video.play();
   };
 
   // Load HLS
   const loadHLS = async (video: HTMLVideoElement, ch: Channel) => {
-    if (window.Hls && window.Hls.isSupported()) {
-      const hls = new window.Hls({
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
-        maxBufferSize: 60 * 1000 * 1000,
-        maxBufferHole: 0.5,
+    const streamUrl = ch.stream_url;
+    const resume = loadResumePosition(ch.id);
+
+    // Try native first when appropriate
+    if (!mustProxy(streamUrl) && video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = streamUrl;
+      if (resume != null) video.currentTime = resume;
+      await video.play();
+      return;
+    }
+
+    // Ensure Hls lib loaded
+    if (!window.Hls) {
+      const hlsScript = document.createElement('script');
+      hlsScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.7/hls.min.js';
+      hlsScript.async = true;
+      document.head.appendChild(hlsScript);
+      await new Promise(resolve => hlsScript.onload = resolve).catch(()=>{});
+    }
+
+    if (window.Hls && window.Hls.isSupported && window.Hls.isSupported()) {
+      const HlsLib = window.Hls;
+      const lowEnd = (navigator as any).hardwareConcurrency <= 4 || (navigator as any).deviceMemory <= 2;
+      const hls = new HlsLib({
+        enableWorker: !lowEnd,
         lowLatencyMode: false,
-        startLevel: -1
+        startLevel: -1,
+        maxBufferLength: lowEnd ? 40 : 30,
+        maxBufferSize: lowEnd ? 60 * 1000 * 1000 : 90 * 1000 * 1000,
       });
 
       hlsRef.current = hls;
+      let triedBackup = false;
 
-      hls.loadSource(ch.stream_url);
+      hls.loadSource(streamUrl);
       hls.attachMedia(video);
 
-      hls.on(window.Hls.Events.MANIFEST_PARSED, (_: any, data: any) => {
-        const qualities = data.levels.map((l: any) => `${l.height}p`);
-        setAvailableQualities(['auto', ...qualities]);
-        video.play();
+      hls.on(HlsLib.Events.MANIFEST_PARSED, (_: any, data: any) => {
+        try {
+          const qualities = data.levels.map((l: any) => `${l.height}p`);
+          setAvailableQualities(['auto', ...qualities]);
+        } catch {}
+        if (resume != null) {
+          try { video.currentTime = resume; } catch {}
+        }
+        video.play().catch(() => {});
       });
 
-      hls.on(window.Hls.Events.ERROR, (_: any, data: any) => {
+      hls.on(HlsLib.Events.ERROR, (_: any, data: any) => {
+        if (!data) return;
         if (data.fatal) {
-          console.error('HLS error:', data);
+          console.error('HLS fatal error', data);
+          if (!triedBackup) {
+            triedBackup = true;
+            try { hls.destroy(); } catch {}
+            const backup = withBackupProxy(streamUrl);
+            const h2 = new HlsLib();
+            hlsRef.current = h2;
+            h2.loadSource(backup);
+            h2.attachMedia(video);
+            return;
+          }
           setError('Stream error occurred');
+        } else {
+          // try to recover non-fatal
+          try { hls.recoverMediaError(); } catch {}
         }
       });
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = ch.stream_url;
-      await video.play();
     } else {
-      throw new Error('HLS not supported');
+      // fallback to native src
+      video.src = streamUrl;
+      if (resume != null) video.currentTime = resume;
+      await video.play();
     }
   };
 
@@ -314,12 +531,17 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     await video.play();
   };
 
-  // Video event handlers
+  // Video event handlers (unchanged behavior + resume save)
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
-    const handleTimeUpdate = () => setCurrentTime(video.currentTime);
+    const handleTimeUpdate = () => {
+      setCurrentTime(video.currentTime);
+      try {
+        if (channel?.id) saveResumePosition(channel.id, video.currentTime);
+      } catch {}
+    };
     const handleDurationChange = () => setDuration(video.duration);
     const handlePlay = () => setIsPlaying(true);
     const handlePause = () => setIsPlaying(false);
@@ -341,7 +563,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       video.removeEventListener('waiting', handleWaiting);
       video.removeEventListener('playing', handlePlaying);
     };
-  }, []);
+  }, [channel]);
 
   // Controls visibility
   const showControlsTemporarily = useCallback(() => {
@@ -364,6 +586,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   }, []);
 
   const togglePlay = () => {
+    // if jw active
+    if (jwRef.current && jwRef.current.getState) {
+      try {
+        const state = jwRef.current.getState();
+        if (state === 'playing') jwRef.current.pause();
+        else jwRef.current.play();
+      } catch {}
+      return;
+    }
+
     if (videoRef.current) {
       if (isPlaying) {
         videoRef.current.pause();
@@ -374,6 +606,15 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   };
 
   const toggleMute = () => {
+    if (jwRef.current && jwRef.current.setVolume) {
+      try {
+        if (isMuted) jwRef.current.setVolume(100);
+        else jwRef.current.setVolume(0);
+        setIsMuted(!isMuted);
+      } catch {}
+      return;
+    }
+
     if (videoRef.current) {
       videoRef.current.muted = !isMuted;
       setIsMuted(!isMuted);
@@ -383,6 +624,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newVolume = parseFloat(e.target.value);
     setVolume(newVolume);
+    if (jwRef.current && jwRef.current.setVolume) {
+      try { jwRef.current.setVolume(Math.round(newVolume * 100)); } catch {}
+      setIsMuted(newVolume === 0);
+      return;
+    }
     if (videoRef.current) {
       videoRef.current.volume = newVolume;
       setIsMuted(newVolume === 0);
@@ -401,6 +647,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const time = parseFloat(e.target.value);
+
+    if (jwRef.current && jwRef.current.seek) {
+      try { jwRef.current.seek(time); setCurrentTime(time); } catch {}
+      return;
+    }
+
     if (videoRef.current) {
       videoRef.current.currentTime = time;
       setCurrentTime(time);
@@ -478,6 +730,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
         backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px'
       }}
     >
+      {/* JW container (for jwplayer) */}
+      <div
+        ref={(el) => { if (el && !jwContainerRef.current) jwContainerRef.current = el; }}
+        style={{ position: 'absolute', inset: 0, display: 'none', zIndex: 10 }}
+      />
+
       {/* Video Element */}
       <video
         ref={videoRef}
@@ -648,6 +906,7 @@ declare global {
   interface Window {
     shaka: any;
     Hls: any;
+    jwplayer?: any;
   }
 }
 
