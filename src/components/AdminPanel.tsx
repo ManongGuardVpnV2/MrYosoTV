@@ -1,6 +1,7 @@
+// src/components/AdminPanel.tsx
 import React, { useState, useEffect, useCallback } from 'react';
-import { 
-  Users, Tv, Bell, Plus, Trash2, Lock, Unlock, Ban, 
+import {
+  Users, Tv, Bell, Plus, Trash2, Lock, Unlock, Ban,
   CheckCircle, X, Eye, Activity, Settings, LogOut, Edit2, Save
 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
@@ -21,6 +22,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
   const [activities, setActivities] = useState<UserActivity[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false); // <-- new
   const [showAddChannel, setShowAddChannel] = useState(false);
   const [showAddNotification, setShowAddNotification] = useState(false);
   const [editingChannel, setEditingChannel] = useState<Channel | null>(null);
@@ -55,6 +57,11 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
         supabase.from('notifications').select('*').order('created_at', { ascending: false })
       ]);
 
+      if (channelsRes.error) console.error('Channels fetch error:', channelsRes.error);
+      if (usersRes.error) console.error('Users fetch error:', usersRes.error);
+      if (activitiesRes.error) console.error('Activities fetch error:', activitiesRes.error);
+      if (notificationsRes.error) console.error('Notifications fetch error:', notificationsRes.error);
+
       if (channelsRes.data) setChannels(channelsRes.data);
       if (usersRes.data) setUsers(usersRes.data);
       if (activitiesRes.data) setActivities(activitiesRes.data as any);
@@ -69,7 +76,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
   useEffect(() => {
     fetchData();
 
-    // Real-time subscriptions
+    // Real-time subscriptions (keeps it simple)
     const activitySubscription = supabase
       .channel('activity_changes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'user_activity' }, () => {
@@ -84,38 +91,68 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
 
   // Channel operations
   const handleAddChannel = async () => {
+    // basic validation
+    if (!channelForm.name || !channelForm.stream_url) {
+      alert('Please provide channel name and stream URL.');
+      return;
+    }
+
+    setIsSubmitting(true);
     try {
-      const { error } = await supabase.from('channels').insert({
+      const payload = {
         ...channelForm,
         display_order: channels.length + 1
-      });
+      };
 
-      if (error) throw error;
+      const { data, error } = await supabase.from('channels').insert(payload).select().single();
 
+      if (error) {
+        console.error('Error adding channel:', error);
+        alert(`Failed to add channel: ${error.message || JSON.stringify(error)}`);
+        return;
+      }
+
+      // success
       setShowAddChannel(false);
       resetChannelForm();
       fetchData();
-    } catch (error) {
-      console.error('Error adding channel:', error);
+    } catch (err) {
+      console.error('Error adding channel (exception):', err);
+      alert('An unexpected error occurred while adding the channel.');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   const handleUpdateChannel = async () => {
     if (!editingChannel) return;
 
+    if (!channelForm.name || !channelForm.stream_url) {
+      alert('Please provide channel name and stream URL.');
+      return;
+    }
+
+    setIsSubmitting(true);
     try {
       const { error } = await supabase
         .from('channels')
         .update(channelForm)
         .eq('id', editingChannel.id);
 
-      if (error) throw error;
+      if (error) {
+        console.error('Error updating channel:', error);
+        alert(`Failed to update channel: ${error.message || JSON.stringify(error)}`);
+        return;
+      }
 
       setEditingChannel(null);
       resetChannelForm();
       fetchData();
-    } catch (error) {
-      console.error('Error updating channel:', error);
+    } catch (err) {
+      console.error('Error updating channel (exception):', err);
+      alert('An unexpected error occurred while updating the channel.');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -128,6 +165,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
       fetchData();
     } catch (error) {
       console.error('Error deleting channel:', error);
+      alert('Failed to delete channel.');
     }
   };
 
@@ -142,6 +180,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
       fetchData();
     } catch (error) {
       console.error('Error toggling lock:', error);
+      alert('Failed to toggle lock.');
     }
   };
 
@@ -171,24 +210,35 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
       fetchData();
     } catch (error) {
       console.error('Error toggling ban:', error);
+      alert('Failed to toggle ban.');
     }
   };
 
   // Notification operations
   const handleAddNotification = async () => {
+    if (!notificationForm.title || !notificationForm.message) {
+      alert('Please enter title and message for the notification.');
+      return;
+    }
+
     try {
       const { error } = await supabase.from('notifications').insert({
         ...notificationForm,
         is_active: true
       });
 
-      if (error) throw error;
+      if (error) {
+        console.error('Error adding notification:', error);
+        alert(`Failed to add notification: ${error.message || JSON.stringify(error)}`);
+        return;
+      }
 
       setShowAddNotification(false);
       setNotificationForm({ title: '', message: '' });
       fetchData();
     } catch (error) {
       console.error('Error adding notification:', error);
+      alert('Failed to add notification.');
     }
   };
 
@@ -199,6 +249,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
       fetchData();
     } catch (error) {
       console.error('Error deleting notification:', error);
+      alert('Failed to delete notification.');
     }
   };
 
@@ -237,6 +288,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
             <button
               onClick={() => { logout(); onClose(); }}
               className="flex items-center gap-2 px-4 py-2 bg-red-600/20 text-red-400 rounded-lg hover:bg-red-600/30 transition-colors"
+              type="button"
             >
               <LogOut className="w-4 h-4" />
               <span className="hidden sm:inline">Logout</span>
@@ -244,6 +296,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
             <button
               onClick={onClose}
               className="p-2 text-amber-400 hover:bg-amber-900/50 rounded-lg transition-colors"
+              type="button"
             >
               <X className="w-6 h-6" />
             </button>
@@ -261,6 +314,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                   ? 'bg-amber-600 text-white'
                   : 'bg-amber-900/30 text-amber-300 hover:bg-amber-900/50'
               }`}
+              type="button"
             >
               {tab.icon}
               {tab.label}
@@ -273,7 +327,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
           <div className="flex items-center justify-center h-64">
             <div className="flex gap-1">
               {'LOADING'.split('').map((letter, i) => (
-                <span 
+                <span
                   key={i}
                   className="text-2xl font-bold text-amber-400 animate-bounce"
                   style={{ animationDelay: `${i * 0.1}s` }}
@@ -291,8 +345,9 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                 <div className="flex justify-between items-center mb-4">
                   <h2 className="text-xl text-amber-200">Manage Channels ({channels.length})</h2>
                   <button
-                    onClick={() => setShowAddChannel(true)}
+                    onClick={() => { setShowAddChannel(true); setEditingChannel(null); resetChannelForm(); }}
                     className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+                    type="button"
                   >
                     <Plus className="w-4 h-4" />
                     Add Channel
@@ -301,12 +356,12 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
 
                 {/* Channel Form Modal */}
                 {(showAddChannel || editingChannel) && (
-                  <div className="fixed inset-0 z-60 bg-black/80 flex items-center justify-center p-4">
+                  <div className="fixed inset-0 z-[9999] bg-black/80 flex items-center justify-center p-4">
                     <div className="bg-amber-950 rounded-xl p-6 max-w-2xl w-full max-h-[90vh] overflow-y-auto border border-amber-800">
                       <h3 className="text-xl font-bold text-amber-400 mb-4">
                         {editingChannel ? 'Edit Channel' : 'Add New Channel'}
                       </h3>
-                      
+
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div>
                           <label className="block text-amber-300 text-sm mb-1">Name</label>
@@ -420,17 +475,20 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
 
                       <div className="flex justify-end gap-3 mt-6">
                         <button
+                          type="button"
                           onClick={() => { setShowAddChannel(false); setEditingChannel(null); resetChannelForm(); }}
                           className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700"
                         >
                           Cancel
                         </button>
                         <button
+                          type="button"
                           onClick={editingChannel ? handleUpdateChannel : handleAddChannel}
-                          className="flex items-center gap-2 px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700"
+                          className={`flex items-center gap-2 px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 ${isSubmitting ? 'opacity-60 cursor-wait' : ''}`}
+                          disabled={isSubmitting}
                         >
                           <Save className="w-4 h-4" />
-                          {editingChannel ? 'Update' : 'Save'}
+                          {isSubmitting ? (editingChannel ? 'Updating...' : 'Saving...') : (editingChannel ? 'Update' : 'Save')}
                         </button>
                       </div>
                     </div>
@@ -472,18 +530,21 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                                 <button
                                   onClick={() => startEditChannel(channel)}
                                   className="p-2 text-blue-400 hover:bg-blue-900/30 rounded-lg"
+                                  type="button"
                                 >
                                   <Edit2 className="w-4 h-4" />
                                 </button>
                                 <button
                                   onClick={() => handleToggleLock(channel)}
                                   className={`p-2 rounded-lg ${channel.is_locked ? 'text-green-400 hover:bg-green-900/30' : 'text-yellow-400 hover:bg-yellow-900/30'}`}
+                                  type="button"
                                 >
                                   {channel.is_locked ? <Unlock className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
                                 </button>
                                 <button
                                   onClick={() => handleDeleteChannel(channel.id)}
                                   className="p-2 text-red-400 hover:bg-red-900/30 rounded-lg"
+                                  type="button"
                                 >
                                   <Trash2 className="w-4 h-4" />
                                 </button>
@@ -537,7 +598,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                               )}
                             </td>
                             <td className="px-4 py-3 text-amber-400 text-sm">
-                              {new Date(user.last_activity).toLocaleString()}
+                              {user.last_activity ? new Date(user.last_activity).toLocaleString() : '-'}
                             </td>
                             <td className="px-4 py-3 text-amber-300 text-sm">
                               {user.current_channel ? (
@@ -553,6 +614,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                                   <button
                                     onClick={() => handleToggleBan(user)}
                                     className={`p-2 rounded-lg ${user.is_banned ? 'text-green-400 hover:bg-green-900/30' : 'text-red-400 hover:bg-red-900/30'}`}
+                                    type="button"
                                   >
                                     {user.is_banned ? <CheckCircle className="w-4 h-4" /> : <Ban className="w-4 h-4" />}
                                   </button>
@@ -622,6 +684,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                   <button
                     onClick={() => setShowAddNotification(true)}
                     className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+                    type="button"
                   >
                     <Plus className="w-4 h-4" />
                     Add Notification
@@ -630,10 +693,10 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
 
                 {/* Add Notification Modal */}
                 {showAddNotification && (
-                  <div className="fixed inset-0 z-60 bg-black/80 flex items-center justify-center p-4">
+                  <div className="fixed inset-0 z-[9999] bg-black/80 flex items-center justify-center p-4">
                     <div className="bg-amber-950 rounded-xl p-6 max-w-md w-full border border-amber-800">
                       <h3 className="text-xl font-bold text-amber-400 mb-4">Add Notification</h3>
-                      
+
                       <div className="space-y-4">
                         <div>
                           <label className="block text-amber-300 text-sm mb-1">Title</label>
@@ -659,12 +722,14 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                         <button
                           onClick={() => setShowAddNotification(false)}
                           className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700"
+                          type="button"
                         >
                           Cancel
                         </button>
                         <button
                           onClick={handleAddNotification}
                           className="px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700"
+                          type="button"
                         >
                           Send
                         </button>
@@ -690,6 +755,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                       <button
                         onClick={() => handleDeleteNotification(notification.id)}
                         className="p-2 text-red-400 hover:bg-red-900/30 rounded-lg"
+                        type="button"
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>
