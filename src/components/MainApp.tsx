@@ -276,24 +276,6 @@ const MainApp: React.FC = () => {
               </div>
             </div>
           )}
-
-          {/* Welcome Message when no channel selected */}
-          {!selectedChannel && (
-            <div 
-              className="text-center py-12 rounded-xl"
-              style={{
-                background: 'linear-gradient(135deg, rgba(62, 39, 35, 0.6) 0%, rgba(45, 24, 16, 0.6) 100%)',
-                border: '2px solid rgba(139, 90, 43, 0.3)'
-              }}
-            >
-              <h2 className="text-2xl md:text-3xl font-bold text-amber-400 mb-4">
-                Welcome to PinoyTV
-              </h2>
-              <p className="text-amber-300/70 max-w-md mx-auto">
-                Select a channel from the sidebar to start watching your favorite content.
-              </p>
-            </div>
-          )}
         </div>
       </main>
 
