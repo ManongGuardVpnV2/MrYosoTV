@@ -250,32 +250,6 @@ const MainApp: React.FC = () => {
               onChannelChange={handleChannelChange}
             />
           </div>
-
-          {/* Current Channel Info */}
-          {selectedChannel && (
-            <div 
-              className="p-4 rounded-xl mb-6"
-              style={{
-                background: 'linear-gradient(135deg, rgba(62, 39, 35, 0.8) 0%, rgba(45, 24, 16, 0.8) 100%)',
-                border: '2px solid rgba(139, 90, 43, 0.5)',
-                boxShadow: '0 0 20px rgba(0,0,0,0.5)'
-              }}
-            >
-              <div className="flex items-center gap-4">
-                {selectedChannel.thumbnail_url && (
-                  <img 
-                    src={selectedChannel.thumbnail_url} 
-                    alt={selectedChannel.name}
-                    className="w-16 h-12 object-cover rounded-lg border-2 border-amber-800"
-                  />
-                )}
-                <div>
-                  <h2 className="text-xl font-bold text-amber-200">{selectedChannel.name}</h2>
-                  <p className="text-amber-500 text-sm">{selectedChannel.category}</p>
-                </div>
-              </div>
-            </div>
-          )}
         </div>
       </main>
 
