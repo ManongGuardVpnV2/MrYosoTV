@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Lock, ChevronRight, ChevronLeft, Search, Tv } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { Channel, Category, CATEGORIES, CATEGORY_GEMS } from '@/types';
@@ -9,6 +9,8 @@ interface ChannelSidebarProps {
   isCollapsed: boolean;
   onToggleCollapse: () => void;
 }
+
+const BACKGROUND_IMAGE = 'https://d64gsuwffb70l.cloudfront.net/6966ff2969d41bac5afce556_1768357781130_1774fa95.jpg';
 
 const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
   selectedChannel,
@@ -46,11 +48,18 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
   }, [fetchChannels]);
 
   // Filter channels
-  const filteredChannels = channels.filter(channel => {
-    const matchesCategory = channel.category === selectedCategory;
-    const matchesSearch = channel.name.toLowerCase().includes(searchQuery.toLowerCase());
-    return matchesCategory && matchesSearch;
-  });
+  const filteredChannels = useMemo(() => {
+    return channels.filter(channel => {
+      const matchesCategory = channel.category === selectedCategory;
+      const matchesSearch = channel.name.toLowerCase().includes(searchQuery.toLowerCase());
+      return matchesCategory && matchesSearch;
+    });
+  }, [channels, selectedCategory, searchQuery]);
+
+  // Sort alphabetically (non-mutating)
+  const sortedChannels = useMemo(() => {
+    return [...filteredChannels].sort((a, b) => a.name.localeCompare(b.name));
+  }, [filteredChannels]);
 
   return (
     <>
@@ -74,7 +83,11 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
         style={{
           width: '320px',
           maxWidth: '100vw',
-          background: 'linear-gradient(135deg, #1a0f0a 0%, #2d1810 50%, #1a0f0a 100%)',
+          // Gradient overlay on top of the provided "devil" background image
+          backgroundImage: `linear-gradient(135deg, rgba(26,15,10,0.9) 0%, rgba(45,24,16,0.9) 50%, rgba(26,15,10,0.9) 100%), url('${BACKGROUND_IMAGE}')`,
+          backgroundSize: 'cover',
+          backgroundPosition: 'center',
+          backgroundRepeat: 'no-repeat',
           borderLeft: '3px solid #5d4037',
           boxShadow: '-10px 0 30px rgba(0,0,0,0.5)'
         }}
@@ -83,7 +96,7 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
         <div 
           className="p-4 border-b border-amber-900/50"
           style={{
-            background: 'linear-gradient(180deg, #3e2723 0%, #2d1810 100%)'
+            background: 'linear-gradient(180deg, rgba(62,39,35,0.6) 0%, rgba(45,24,16,0.6) 100%)'
           }}
         >
           <div className="flex items-center gap-2 mb-4">
@@ -144,15 +157,15 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
                 ))}
               </div>
             </div>
-          ) : filteredChannels.length === 0 ? (
+          ) : sortedChannels.length === 0 ? (
             <div className="text-center py-8 text-amber-600">
               No channels found for {selectedCategory}
             </div>
           ) : (
             <div className="p-2">
-              {/* Flat view for the selected single category (Cignal by default) */}
+              {/* Alphabetical flat view for the selected single category (Cignal by default) */}
               <div className="space-y-1">
-                {filteredChannels.map((channel) => (
+                {sortedChannels.map((channel) => (
                   <ChannelItem
                     key={channel.id}
                     channel={channel}
@@ -168,10 +181,10 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
         {/* Footer */}
         <div 
           className="absolute bottom-0 left-0 right-0 p-3 border-t border-amber-900/50 text-center"
-          style={{ background: 'linear-gradient(0deg, #1a0f0a 0%, transparent 100%)' }}
+          style={{ background: 'linear-gradient(0deg, rgba(26,15,10,0.75) 0%, transparent 100%)' }}
         >
           <p className="text-amber-600 text-xs">
-            {filteredChannels.length} channels in {selectedCategory}
+            {sortedChannels.length} channels in {selectedCategory}
           </p>
         </div>
       </div>
