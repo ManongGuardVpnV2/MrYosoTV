@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react'; 
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, SkipBack, SkipForward } from 'lucide-react';
 import { Channel } from '@/types';
 
@@ -117,6 +117,10 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const controlsTimeoutRef = useRef<NodeJS.Timeout>();
   const adPlayedRef = useRef(false);
 
+  // WATCHDOG: detect freeze / stall
+  const lastProgressRef = useRef<{ time: number; currentTime: number }>({ time: Date.now(), currentTime: 0 });
+  const watchdogIntervalRef = useRef<number | null>(null);
+
   // Load Shaka Player and HLS.js dynamically
   useEffect(() => {
     const loadScripts = async () => {
@@ -144,6 +148,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
   // Cleanup function
   const cleanup = useCallback(() => {
+    // stop watchdog
+    if (watchdogIntervalRef.current) {
+      clearInterval(watchdogIntervalRef.current);
+      watchdogIntervalRef.current = null;
+    }
+
     if (shakaPlayerRef.current) {
       try { shakaPlayerRef.current.destroy(); } catch(e){ console.warn('shaka destroy', e); }
       shakaPlayerRef.current = null;
@@ -201,7 +211,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     loadChannel();
 
     return cleanup;
-  }, [channel, cleanup]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channel]);
 
   // Play the ad (supports MP4 or M3U8 proxied URLs)
   const playAd = async (video: HTMLVideoElement, adUrl: string) => {
@@ -361,73 +372,202 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
   // Play direct video
   const playDirect = async (video: HTMLVideoElement, url: string) => {
+    // Optimize: allow immediate preload and muted autoplay attempt to reduce delay
+    video.preload = 'auto';
+    video.muted = true; // attempt autoplay
     video.src = url;
     await video.play().catch(e => console.warn('Direct play error', e));
+    // restore muted state to UI preference if needed
+    if (!isMuted) {
+      try { video.muted = false; } catch {}
+    }
   };
 
-  // Load HLS
+  // Load HLS: tuned for low latency + robust error recovery
   const loadHLS = async (video: HTMLVideoElement, ch: Channel) => {
-    if (window.Hls && window.Hls.isSupported()) {
-      const hls = new window.Hls({
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
-        maxBufferSize: 60 * 1000 * 1000,
-        maxBufferHole: 0.5,
-        lowLatencyMode: false,
-        startLevel: -1
-      });
-
-      // cleanup any previous
-      if (hlsRef.current) {
-        try { hlsRef.current.destroy(); } catch(e) { /* ignore */ }
-        hlsRef.current = null;
+    // If native HLS is supported (Safari), prefer native (it's often the lowest-latency)
+    if (!window.Hls) {
+      if (video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = ch.stream_url;
+        video.preload = 'auto';
+        video.muted = true;
+        await video.play().catch(()=>{});
+        if (!isMuted) video.muted = false;
+        return;
       }
-
-      hlsRef.current = hls;
-      hls.loadSource(ch.stream_url);
-      hls.attachMedia(video);
-
-      hls.on(window.Hls.Events.MANIFEST_PARSED, (_: any, data: any) => {
-        const qualities = data.levels.map((l: any) => `${l.height}p`);
-        setAvailableQualities(['auto', ...qualities]);
-        video.play().catch(() => {});
-      });
-
-      hls.on(window.Hls.Events.ERROR, (_: any, data: any) => {
-        if (data.fatal) {
-          console.error('HLS error:', data);
-          setError('Stream error occurred');
-        }
-      });
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = ch.stream_url;
-      await video.play().catch(() => {});
-    } else {
       throw new Error('HLS not supported');
     }
+
+    // Cleanup previous
+    if (hlsRef.current) {
+      try { hlsRef.current.destroy(); } catch (e) { console.warn('hls destroy', e); }
+      hlsRef.current = null;
+    }
+
+    // HLS.js configuration tuned for fast start and low-latency live
+    const hlsConfig = {
+      enableWorker: true,
+      maxBufferLength: 25,            // keep buffer reasonably low to reduce latency
+      maxMaxBufferLength: 45,
+      maxBufferSize: 60 * 1000 * 1000,
+      maxBufferHole: 0.5,
+      lowLatencyMode: true,           // enable LL-HLS support when available
+      liveSyncDuration: 3,            // target distance from live (seconds)
+      liveMaxLatencyDuration: 12,     // upper bound on latency to live edge
+      startLevel: -1,
+      startFragPrefetch: true,
+      capLevelToPlayerSize: true,
+      // nudgeOffset and nudgeMaxRetry are helpful in some network cases
+      nudgeOffset: 0.1,
+      nudgeMaxRetry: 3
+    };
+
+    const hls = new window.Hls(hlsConfig);
+    hlsRef.current = hls;
+
+    // attach and load
+    hls.loadSource(ch.stream_url);
+    hls.attachMedia(video);
+
+    // attempt immediate autoplay via muted trick (improves "no autoplay" on some browsers)
+    video.preload = 'auto';
+    video.muted = true;
+    try { await video.play().catch(()=>{}); } catch {}
+
+    // HLS event handlers - populate qualities and add robust error recovery
+    hls.on(window.Hls.Events.MANIFEST_PARSED, (_: any, data: any) => {
+      try {
+        const qualities = (data.levels || []).map((l: any) => `${l.height || l.name || 'auto'}p`);
+        setAvailableQualities(Array.from(new Set(['auto', ...qualities])));
+        // start loading from live edge
+        hls.startLoad(-1);
+        // if we can autoplay, try; otherwise UI play will work
+        video.play().catch(()=>{});
+      } finally {
+        setIsLoading(false);
+      }
+    });
+
+    // When fragments buffered, clear loading UI
+    hls.on(window.Hls.Events.FRAG_BUFFERED, () => {
+      setIsLoading(false);
+    });
+
+    // Listen to level updated to reflect resolution changes
+    hls.on(window.Hls.Events.LEVEL_SWITCHED, () => {
+      // nothing here, but could be used to set current quality
+    });
+
+    // Error handling - aggressive recovery for network/media errors
+    hls.on(window.Hls.Events.ERROR, (_: any, data: any) => {
+      console.warn('HLS error event:', data);
+      if (!data || !data.fatal) return;
+
+      try {
+        // Try to auto-recover common fatal error types
+        if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
+          // attempt to restart loading
+          try {
+            hls.startLoad();
+            setTimeout(() => { /* Let the loader settle */ }, 500);
+          } catch (e) {
+            console.warn('hls network recovery failed', e);
+            try { hls.destroy(); } catch {}
+          }
+        } else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+          try {
+            hls.recoverMediaError();
+          } catch (e) {
+            console.warn('hls media recovery error', e);
+            try { hls.destroy(); } catch {}
+          }
+        } else {
+          // fallback: full reload of hls instance
+          try {
+            hls.destroy();
+            // re-create and re-attach one time
+            const newHls = new window.Hls(hlsConfig);
+            hlsRef.current = newHls;
+            newHls.loadSource(ch.stream_url);
+            newHls.attachMedia(video);
+            newHls.startLoad(-1);
+          } catch (e) {
+            console.error('hls full reload failed', e);
+            setError('Stream error occurred');
+          }
+        }
+      } catch (e) {
+        console.error('hls error handling broken', e);
+      }
+    });
+
+    // Keep last-progress for watchdog
+    lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime || 0 };
+
+    // Start a lightweight watchdog to detect stalls (no progress for X seconds)
+    if (watchdogIntervalRef.current) {
+      clearInterval(watchdogIntervalRef.current);
+      watchdogIntervalRef.current = null;
+    }
+    watchdogIntervalRef.current = window.setInterval(() => {
+      try {
+        const now = Date.now();
+        const prev = lastProgressRef.current;
+        if (video.paused || video.seeking || isAdPlaying) {
+          lastProgressRef.current = { time: now, currentTime: video.currentTime };
+          return;
+        }
+        // If no progress in >6s while playing, attempt recovery
+        if (video.currentTime === prev.currentTime && now - prev.time > 6000) {
+          console.warn('Watchdog: detected stall, attempting recovery');
+          // try media error recovery
+          try { hls.recoverMediaError(); } catch(e){ console.warn('recoverMediaError failed', e); }
+          // if still stalled, try restarting load
+          try { hls.stopLoad(); hls.startLoad(-1); } catch(e){ console.warn('hls restart failed', e); }
+          lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime };
+        } else {
+          // progress observed -> update
+          lastProgressRef.current = { time: now, currentTime: video.currentTime };
+        }
+      } catch (e) {
+        // ignore
+      }
+    }, 2500);
   };
 
   // Load MPD (DASH) with Shaka
   const loadMPD = async (video: HTMLVideoElement, ch: Channel) => {
     if (!window.shaka) throw new Error('Shaka Player not loaded');
 
+    // Cleanup previous
+    if (shakaPlayerRef.current) {
+      try { shakaPlayerRef.current.destroy(); } catch(e) { console.warn('old shaka destroy', e); }
+      shakaPlayerRef.current = null;
+    }
+
     const player = new window.shaka.Player(video);
     shakaPlayerRef.current = player;
 
+    // Configure Shaka for low latency + robust behavior
     player.configure({
       streaming: {
-        bufferingGoal: 10,
-        rebufferingGoal: 2,
+        lowLatencyMode: true,      // enable LL-DASH/Low-latency behavior when the manifest supports it
+        bufferingGoal: 10,         // seconds - keep this moderate to reduce latency
+        rebufferingGoal: 1,        // seconds - attempt to rebuffer quickly
         bufferBehind: 30,
+        smallGapLimit: 0.5,
+        ignoreMinBufferTime: true
+      },
+      abr: {
+        enabled: true,
+        defaultBandwidthEstimate: 5000000, // bias initial selection toward higher BW to avoid slow startup switching
+      },
+      manifest: {
         retryParameters: {
           maxAttempts: 5,
           baseDelay: 1000,
           backoffFactor: 2
         }
-      },
-      abr: {
-        enabled: true,
-        defaultBandwidthEstimate: 5000000
       }
     });
 
@@ -449,6 +589,17 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     player.addEventListener('error', (event: any) => {
       console.error('Shaka error:', event.detail);
       setError('Playback error occurred');
+      // Attempt a soft recovery on network errors
+      try {
+        const severity = event.detail && event.detail.severity;
+        if (severity === window.shaka.util.Error.Severity.RECOVERABLE) {
+          // try to reconfigure ABR to be more conservative
+          player.configure({ abr: { enabled: true, defaultBandwidthEstimate: 1000000 } });
+        } else {
+          // fatal -> try reloading manifest once
+          player.unload().then(() => player.load(ch.stream_url)).catch(e => console.warn('shaka reload failed', e));
+        }
+      } catch(e){}
     });
 
     player.addEventListener('adaptation', () => {
@@ -457,8 +608,56 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       setAvailableQualities(['auto', ...qualities]);
     });
 
-    await player.load(ch.stream_url);
-    await video.play().catch(() => {});
+    // Start load
+    try {
+      await player.load(ch.stream_url);
+      video.preload = 'auto';
+      video.muted = true;
+      await video.play().catch(()=>{});
+      if (!isMuted) video.muted = false;
+    } catch (e) {
+      console.error('Shaka load/play failed', e);
+      setError('Failed to load DASH stream');
+    }
+
+    // Watchdog for Shaka: watch for stalls and try to recover by reducing quality
+    lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime || 0 };
+    if (watchdogIntervalRef.current) {
+      clearInterval(watchdogIntervalRef.current);
+      watchdogIntervalRef.current = null;
+    }
+    watchdogIntervalRef.current = window.setInterval(() => {
+      try {
+        const now = Date.now();
+        const prev = lastProgressRef.current;
+        if (video.paused || video.seeking || isAdPlaying) {
+          lastProgressRef.current = { time: now, currentTime: video.currentTime };
+          return;
+        }
+        if (video.currentTime === prev.currentTime && now - prev.time > 6000) {
+          console.warn('Watchdog (shaka): detected stall, attempting recovery');
+          // Try lowering ABR aggressiveness or selecting lower track
+          try {
+            const tracks = shakaPlayerRef.current.getVariantTracks().filter((t:any) => t.allowed);
+            const sorted = tracks.sort((a:any,b:any)=>a.bandwidth-b.bandwidth);
+            if (sorted.length) {
+              const lowest = sorted[0];
+              shakaPlayerRef.current.configure({ abr: { enabled: false } });
+              shakaPlayerRef.current.selectVariantTrack(lowest, /*clearBuffer=*/ true);
+            } else {
+              // fallback: reload manifest
+              shakaPlayerRef.current.reload();
+            }
+          } catch (e) {
+            console.warn('shaka watchdog recovery failed', e);
+            try { shakaPlayerRef.current.reload(); } catch {}
+          }
+          lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime };
+        } else {
+          lastProgressRef.current = { time: now, currentTime: video.currentTime };
+        }
+      } catch (e) {}
+    }, 2500);
   };
 
   // Video event handlers
@@ -515,7 +714,10 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       if (isPlaying) {
         videoRef.current.pause();
       } else {
-        videoRef.current.play().catch(()=>{});
+        // Some browsers block autoplay if not muted; attempt play and swallow errors
+        if (videoRef.current.paused) {
+          videoRef.current.play().catch(()=>{});
+        }
       }
     }
   };
@@ -568,6 +770,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     if (hlsRef.current) {
       if (q === 'auto') {
         hlsRef.current.currentLevel = -1;
+        hlsRef.current.loadLevel = -1;
       } else {
         const level = hlsRef.current.levels.findIndex((l: any) => `${l.height}p` === q);
         if (level !== -1) hlsRef.current.currentLevel = level;
