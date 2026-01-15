@@ -92,6 +92,8 @@ const StaticNoise: React.FC = () => {
   );
 };
 
+const PROXY_BASE = 'https://poohlover.serv00.net/stream-proxy.php?url='; // Your unified proxy endpoint
+
 const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -110,8 +112,10 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const [quality, setQuality] = useState<string>('auto');
   const [showSettings, setShowSettings] = useState(false);
   const [availableQualities, setAvailableQualities] = useState<string[]>(['auto']);
+  const [isAdPlaying, setIsAdPlaying] = useState(false);
 
   const controlsTimeoutRef = useRef<NodeJS.Timeout>();
+  const adPlayedRef = useRef(false);
 
   // Load Shaka Player and HLS.js dynamically
   useEffect(() => {
@@ -141,22 +145,28 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   // Cleanup function
   const cleanup = useCallback(() => {
     if (shakaPlayerRef.current) {
-      shakaPlayerRef.current.destroy();
+      try { shakaPlayerRef.current.destroy(); } catch(e){ console.warn('shaka destroy', e); }
       shakaPlayerRef.current = null;
     }
     if (hlsRef.current) {
-      hlsRef.current.destroy();
+      try { hlsRef.current.destroy(); } catch(e){ console.warn('hls destroy', e); }
       hlsRef.current = null;
     }
     if (videoRef.current) {
+      videoRef.current.pause();
       videoRef.current.src = '';
-      videoRef.current.load();
+      try { videoRef.current.load(); } catch(e) { /* ignore */ }
     }
     setError(null);
     setAvailableQualities(['auto']);
   }, []);
 
-  // Load channel
+  // Reset ad flag when channel changes
+  useEffect(() => {
+    adPlayedRef.current = false;
+  }, [channel?.stream_url]);
+
+  // Load channel (with ad support)
   useEffect(() => {
     if (!channel || !videoRef.current) {
       cleanup();
@@ -171,27 +181,14 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       const video = videoRef.current!;
 
       try {
-        switch (channel.stream_type) {
-          case 'mpd':
-            await loadMPD(video, channel);
-            break;
-          case 'm3u8':
-            await loadHLS(video, channel);
-            break;
-          case 'widevine':
-            await loadWidevine(video, channel);
-            break;
-          case 'youtube':
-            // YouTube embed handled separately
-            break;
-          case 'mp4':
-          case 'ts':
-          case 'direct':
-          default:
-            video.src = channel.stream_url;
-            await video.play();
-            break;
+        // first: attempt to play ad if present and not yet played
+        if (channel.ad_url && !adPlayedRef.current) {
+          adPlayedRef.current = true;
+          await playAd(video, channel.ad_url);
         }
+
+        // then load main stream
+        await loadMainStream(video, channel);
         setIsPlaying(true);
       } catch (err: any) {
         console.error('Error loading channel:', err);
@@ -206,7 +203,211 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     return cleanup;
   }, [channel, cleanup]);
 
-  // Load MPD with ClearKey
+  // Play the ad (supports MP4 or M3U8 proxied URLs)
+  const playAd = async (video: HTMLVideoElement, adUrl: string) => {
+    try {
+      setIsAdPlaying(true);
+      setShowControls(true);
+      setIsLoading(true);
+
+      const resolved = resolveProxyIfNeeded(adUrl);
+
+      // detect ad type quickly
+      const type = await detectType(resolved);
+
+      return new Promise<void>(async (resolve, reject) => {
+        const cleanupHandlers = () => {
+          video.onended = null;
+          video.onerror = null;
+        };
+
+        video.onended = () => {
+          cleanupHandlers();
+          setIsAdPlaying(false);
+          resolve();
+        };
+
+        video.onerror = (e) => {
+          console.warn('Ad playback error, skipping ad', e);
+          cleanupHandlers();
+          setIsAdPlaying(false);
+          resolve(); // resolve so we continue to main stream
+        };
+
+        try {
+          if (type === 'hls') {
+            // use HLS.js for ad manifest
+            if (window.Hls && window.Hls.isSupported()) {
+              const hls = new window.Hls();
+              hlsRef.current = hls;
+              hls.loadSource(resolved);
+              hls.attachMedia(video);
+              hls.on(window.Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+              hls.on(window.Hls.Events.ERROR, (_: any, data: any) => {
+                console.warn('HLS ad error:', data);
+              });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+              video.src = resolved;
+              await video.play().catch(() => {});
+            } else {
+              console.warn('HLS not supported for ad');
+              resolve();
+            }
+          } else {
+            // direct mp4 or other video
+            video.src = resolved;
+            await video.play().catch(() => {});
+          }
+        } catch (e) {
+          console.warn('Ad play exception:', e);
+          cleanupHandlers();
+          setIsAdPlaying(false);
+          resolve();
+        } finally {
+          setIsLoading(false);
+        }
+      });
+    } finally {
+      setIsAdPlaying(false);
+      setIsLoading(false);
+    }
+  };
+
+  // Resolve proxy only if needed (prevents double-wrapping)
+  const resolveProxyIfNeeded = (url: string) => {
+    try {
+      // If already points to our proxy, return as-is
+      if (url.includes('poohlover.serv00.net')) return url;
+
+      const isHttpsPage = location.protocol === 'https:';
+      // If page is HTTPS and url is HTTP (mixed content), proxy it
+      if (isHttpsPage && url.startsWith('http://')) {
+        return PROXY_BASE + encodeURIComponent(url);
+      }
+
+      // If the origin differs and you still want to route through proxy for CORS, uncomment next line
+      // return PROXY_BASE + encodeURIComponent(url);
+
+      return url;
+    } catch (e) {
+      return url;
+    }
+  };
+
+  // detect stream type: 'hls' | 'dash' | 'video' | 'unknown'
+  const detectType = async (url: string) : Promise<'hls'|'dash'|'video'|'unknown'> => {
+    try {
+      // Quick pattern checks
+      const lower = url.toLowerCase();
+      if (lower.includes('.m3u8') || lower.includes('playlist.m3u8') || lower.includes('master.m3u8') || lower.includes('index.m3u8')) return 'hls';
+      if (lower.endsWith('.mpd')) return 'dash';
+      if (lower.match(/\.(mp4|webm|ogg|mkv|ts)(\?|$)/)) return 'video';
+
+      // Try HEAD, but many servers/proxies block it
+      try {
+        const head = await fetch(url, { method: 'HEAD' });
+        const ct = head.headers.get('content-type') || '';
+        if (ct.includes('application/vnd.apple.mpegurl') || ct.includes('application/x-mpegurl')) return 'hls';
+        if (ct.includes('application/dash+xml')) return 'dash';
+        if (ct.startsWith('video/')) return 'video';
+      } catch (e) {
+        // ignore
+      }
+
+      // Fall back to small range GET and inspect text
+      try {
+        const r = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-2048' } });
+        const text = await r.text();
+        if (text.startsWith('#EXTM3U')) return 'hls';
+        if (text.includes('<MPD')) return 'dash';
+        if (text.length > 0 && /\<\!DOCTYPE html\>|<html/i.test(text)) return 'unknown';
+      } catch (e) {
+        // ignore
+      }
+
+      return 'unknown';
+    } catch (e) {
+      return 'unknown';
+    }
+  };
+
+  // Load the main stream (MP4 / HLS / DASH / direct)
+  const loadMainStream = async (video: HTMLVideoElement, ch: Channel) => {
+    const resolved = resolveProxyIfNeeded(ch.stream_url);
+
+    // embed platforms
+    if (resolved.includes('youtube.com') || resolved.includes('youtu.be') || resolved.includes('twitch.tv')) {
+      // handing back to parent render (will render iframe)
+      return;
+    }
+
+    const type = await detectType(resolved);
+
+    if (type === 'dash' || ch.stream_type === 'mpd') {
+      await loadMPD(video, { ...ch, stream_url: resolved });
+    } else if (type === 'hls' || ch.stream_type === 'm3u8') {
+      await loadHLS(video, { ...ch, stream_url: resolved });
+    } else if (type === 'video' || ch.stream_type === 'mp4' || ch.stream_type === 'direct') {
+      await playDirect(video, resolved);
+    } else {
+      // fallback: try HLS, then direct
+      try {
+        await loadHLS(video, { ...ch, stream_url: resolved });
+      } catch {
+        await playDirect(video, resolved);
+      }
+    }
+  };
+
+  // Play direct video
+  const playDirect = async (video: HTMLVideoElement, url: string) => {
+    video.src = url;
+    await video.play().catch(e => console.warn('Direct play error', e));
+  };
+
+  // Load HLS
+  const loadHLS = async (video: HTMLVideoElement, ch: Channel) => {
+    if (window.Hls && window.Hls.isSupported()) {
+      const hls = new window.Hls({
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        maxBufferSize: 60 * 1000 * 1000,
+        maxBufferHole: 0.5,
+        lowLatencyMode: false,
+        startLevel: -1
+      });
+
+      // cleanup any previous
+      if (hlsRef.current) {
+        try { hlsRef.current.destroy(); } catch(e) { /* ignore */ }
+        hlsRef.current = null;
+      }
+
+      hlsRef.current = hls;
+      hls.loadSource(ch.stream_url);
+      hls.attachMedia(video);
+
+      hls.on(window.Hls.Events.MANIFEST_PARSED, (_: any, data: any) => {
+        const qualities = data.levels.map((l: any) => `${l.height}p`);
+        setAvailableQualities(['auto', ...qualities]);
+        video.play().catch(() => {});
+      });
+
+      hls.on(window.Hls.Events.ERROR, (_: any, data: any) => {
+        if (data.fatal) {
+          console.error('HLS error:', data);
+          setError('Stream error occurred');
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = ch.stream_url;
+      await video.play().catch(() => {});
+    } else {
+      throw new Error('HLS not supported');
+    }
+  };
+
+  // Load MPD (DASH) with Shaka
   const loadMPD = async (video: HTMLVideoElement, ch: Channel) => {
     if (!window.shaka) throw new Error('Shaka Player not loaded');
 
@@ -231,14 +432,18 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     });
 
     // Configure ClearKey if provided
-    if (ch.clearkey_kid && ch.clearkey_key) {
+    if ((ch as any).clearkey_kid && (ch as any).clearkey_key) {
       player.configure({
         drm: {
           clearKeys: {
-            [ch.clearkey_kid]: ch.clearkey_key
+            [(ch as any).clearkey_kid]: (ch as any).clearkey_key
           }
         }
       });
+    }
+
+    if ((ch as any).license_url) {
+      player.configure({ drm: { servers: { 'com.widevine.alpha': (ch as any).license_url } } });
     }
 
     player.addEventListener('error', (event: any) => {
@@ -253,65 +458,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     });
 
     await player.load(ch.stream_url);
-    await video.play();
-  };
-
-  // Load HLS
-  const loadHLS = async (video: HTMLVideoElement, ch: Channel) => {
-    if (window.Hls && window.Hls.isSupported()) {
-      const hls = new window.Hls({
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
-        maxBufferSize: 60 * 1000 * 1000,
-        maxBufferHole: 0.5,
-        lowLatencyMode: false,
-        startLevel: -1
-      });
-
-      hlsRef.current = hls;
-
-      hls.loadSource(ch.stream_url);
-      hls.attachMedia(video);
-
-      hls.on(window.Hls.Events.MANIFEST_PARSED, (_: any, data: any) => {
-        const qualities = data.levels.map((l: any) => `${l.height}p`);
-        setAvailableQualities(['auto', ...qualities]);
-        video.play();
-      });
-
-      hls.on(window.Hls.Events.ERROR, (_: any, data: any) => {
-        if (data.fatal) {
-          console.error('HLS error:', data);
-          setError('Stream error occurred');
-        }
-      });
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = ch.stream_url;
-      await video.play();
-    } else {
-      throw new Error('HLS not supported');
-    }
-  };
-
-  // Load Widevine
-  const loadWidevine = async (video: HTMLVideoElement, ch: Channel) => {
-    if (!window.shaka) throw new Error('Shaka Player not loaded');
-
-    const player = new window.shaka.Player(video);
-    shakaPlayerRef.current = player;
-
-    if (ch.license_url) {
-      player.configure({
-        drm: {
-          servers: {
-            'com.widevine.alpha': ch.license_url
-          }
-        }
-      });
-    }
-
-    await player.load(ch.stream_url);
-    await video.play();
+    await video.play().catch(() => {});
   };
 
   // Video event handlers
@@ -368,7 +515,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       if (isPlaying) {
         videoRef.current.pause();
       } else {
-        videoRef.current.play();
+        videoRef.current.play().catch(()=>{});
       }
     }
   };
@@ -443,7 +590,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
   // YouTube embed handling
   if (channel?.stream_type === 'youtube') {
-    const videoId = channel.stream_url.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/)?.[1];
+    const videoId = channel.stream_url.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/)?.[1];
     
     return (
       <div 
@@ -485,6 +632,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
         playsInline
         onClick={togglePlay}
       />
+
+      {/* Ad badge */}
+      {isAdPlaying && (
+        <div className="absolute top-4 right-4 bg-black/70 text-white text-xs px-3 py-1 rounded z-30">Advertisement</div>
+      )}
 
       {/* Static Noise when no channel */}
       {!channel && <StaticNoise />}
