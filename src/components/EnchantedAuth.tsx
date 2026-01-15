@@ -1,17 +1,18 @@
 // src/components/EnchantedAuth.tsx
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Lock, Unlock, Eye, EyeOff, Sparkles, X } from "lucide-react";
 import { useAuth, generateDeviceFingerprint } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
 
-const DEVIL_BOOK =
-  "https://d64gsuwffb70l.cloudfront.net/6966ff2969d41bac5afce556_1768357781130_1774fa95.jpg";
-const ANGEL_BOOK =
+const ANGEL_BG =
   "https://d64gsuwffb70l.cloudfront.net/6966ff2969d41bac5afce556_1768357798348_299e5440.jpg";
+const DEVIL_BG =
+  "https://d64gsuwffb70l.cloudfront.net/6966ff2969d41bac5afce556_1768357781130_1774fa95.jpg";
 const PADLOCK =
   "https://d64gsuwffb70l.cloudfront.net/6966ff2969d41bac5afce556_1768357839315_79c82324.png";
-const FOREST_BG =
-  "https://d64gsuwffb70l.cloudfront.net/6966ff2969d41bac5afce556_1768357818222_990606db.jpg";
+// gentle open sound (public)
+const OPEN_SOUND =
+  "https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg";
 
 interface EnchantedAuthProps {
   onAuthSuccess: () => void;
@@ -19,65 +20,94 @@ interface EnchantedAuthProps {
 
 const EnchantedAuth: React.FC<EnchantedAuthProps> = ({ onAuthSuccess }) => {
   const { login } = useAuth();
-  const [showModal, setShowModal] = useState(false);
-  const [isUnlocked, setIsUnlocked] = useState(false);
-  const [authMode, setAuthMode] = useState<"login" | "signup" | null>(null);
-  const [showPassword, setShowPassword] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [successMessage, setSuccessMessage] = useState("");
-  const [bookAnimation, setBookAnimation] = useState<"devil" | "angel" | null>(
-    null
-  );
-  const [particles, setParticles] = useState<
-    Array<{ id: number; x: number; y: number; delay: number }>
-  >([]);
+
+  // Unlock + book states
+  const [showQuestion, setShowQuestion] = useState(true);
+  const [unlocked, setUnlocked] = useState(false);
+  const [bookOpen, setBookOpen] = useState(false); // when true, the book opens
+  const [currentPage, setCurrentPage] = useState<"login" | "signup">("login"); // right = login, left = signup
+  const [animatingFlip, setAnimatingFlip] = useState(false);
 
   // Form states
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [username, setUsername] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [username, setUsername] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
 
+  // UX states
+  const [error, setError] = useState("");
+  const [successMessage, setSuccessMessage] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+
+  // Particles
+  const [particles, setParticles] = useState<
+    Array<{ id: number; left: number; top: number; delay: number; size: number }>
+  >([]);
   useEffect(() => {
-    const newParticles = Array.from({ length: 30 }, (_, i) => ({
+    const arr = Array.from({ length: 20 }, (_, i) => ({
       id: i,
-      x: Math.random() * 100,
-      y: Math.random() * 100,
-      delay: Math.random() * 5,
+      left: Math.random() * 80 + 10,
+      top: Math.random() * 70 + 10,
+      delay: Math.random() * 3,
+      size: Math.random() * 6 + 3,
     }));
-    setParticles(newParticles);
+    setParticles(arr);
   }, []);
 
-  const handlePadlockClick = () => {
-    if (!isUnlocked) {
-      setShowModal(true);
-    }
+  // Audio ref
+  const openAudioRef = useRef<HTMLAudioElement | null>(null);
+  useEffect(() => {
+    openAudioRef.current = new Audio(OPEN_SOUND);
+    openAudioRef.current.volume = 0.55;
+  }, []);
+
+  // Helpers
+  const resetForms = () => {
+    setEmail("");
+    setPassword("");
+    setUsername("");
+    setConfirmPassword("");
+    setError("");
+    setSuccessMessage("");
   };
 
-  const handleQuestionAnswer = (answer: "yes" | "no") => {
-    if (answer === "yes") {
-      setIsUnlocked(true);
-      setShowModal(false);
+  // Question flow (padlock)
+  const handleAnswer = (ans: "yes" | "no") => {
+    if (ans === "yes") {
+      setUnlocked(true);
+      setShowQuestion(false);
+      // small delay, then open the book and play sound
+      setTimeout(() => {
+        // play sound (catch for autoplay restrictions)
+        try {
+          openAudioRef.current?.play().catch(() => {
+            /* ignore autoplay block — user gesture usually allows play on click */
+          });
+        } catch {}
+        setBookOpen(true);
+        // ensure login page visible first
+        setCurrentPage("login");
+      }, 450);
     } else {
       setError("Mali ang sagot! Subukan muli.");
       setTimeout(() => setError(""), 2000);
     }
   };
 
-  const handleBookClick = (book: "devil" | "angel") => {
-    if (!isUnlocked) {
-      setShowModal(true);
-      return;
-    }
-    setBookAnimation(book);
+  // Flip to signup (left page) or login (right page)
+  const flipTo = (page: "login" | "signup") => {
+    if (animatingFlip) return;
+    if (page === currentPage) return;
+    setAnimatingFlip(true);
+    // flip animation works by toggling .flipped class on .book
     setTimeout(() => {
-      setAuthMode(book === "angel" ? "login" : "signup");
-      setSuccessMessage("");
-      setError("");
-    }, 800);
+      setCurrentPage(page);
+      setAnimatingFlip(false);
+    }, 900); // match CSS animation duration
   };
 
+  // SUBMIT handlers: use supabase signup and your useAuth().login
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
@@ -87,10 +117,10 @@ const EnchantedAuth: React.FC<EnchantedAuthProps> = ({ onAuthSuccess }) => {
     const deviceFingerprint = generateDeviceFingerprint();
 
     try {
-      if (authMode === "signup") {
-        // Validation
-        if (password !== confirmPassword) {
-          setError("Passwords do not match");
+      if (currentPage === "signup") {
+        // validations
+        if (!username || username.trim().length === 0) {
+          setError("Username is required");
           setIsLoading(false);
           return;
         }
@@ -99,13 +129,13 @@ const EnchantedAuth: React.FC<EnchantedAuthProps> = ({ onAuthSuccess }) => {
           setIsLoading(false);
           return;
         }
-        if (!username || username.trim().length === 0) {
-          setError("Username is required");
+        if (password !== confirmPassword) {
+          setError("Passwords do not match");
           setIsLoading(false);
           return;
         }
 
-        // Create auth user only (do NOT attempt client-side insert into public.users if you have RLS)
+        // Create auth user using Supabase
         const { data, error: signUpError } = await supabase.auth.signUp({
           email,
           password,
@@ -118,26 +148,21 @@ const EnchantedAuth: React.FC<EnchantedAuthProps> = ({ onAuthSuccess }) => {
           return;
         }
 
-        const authUser = (data as any)?.user ?? null;
-        if (!authUser || !authUser.id) {
-          setError("Signup failed: no user returned from auth");
-          setIsLoading(false);
-          return;
-        }
-
-        // Signup success -> show message and switch to login form (do not auto-login)
-        setSuccessMessage("Account created successfully! Please log in to continue.");
-        setAuthMode("login");
-        // prefill email and clear passwords for user convenience
-        setPassword("");
-        setConfirmPassword("");
+        // success - prompt them to login
+        setSuccessMessage("Account created successfully! Please log in.");
+        // switch softly to login after a moment
+        setTimeout(() => {
+          setCurrentPage("login");
+          setPassword("");
+          setConfirmPassword("");
+        }, 900);
       } else {
-        // LOGIN flow uses useAuth().login
+        // LOGIN via your auth context
         const result = await login(email, password, deviceFingerprint);
-        if (result.success) {
+        if (result?.success) {
           onAuthSuccess();
         } else {
-          setError(result.error || "Login failed");
+          setError(result?.error || "Login failed");
         }
       }
     } catch (err: any) {
@@ -148,410 +173,396 @@ const EnchantedAuth: React.FC<EnchantedAuthProps> = ({ onAuthSuccess }) => {
     }
   };
 
-  const closeAuthForm = () => {
-    setAuthMode(null);
-    setBookAnimation(null);
-    setEmail("");
-    setPassword("");
-    setUsername("");
-    setConfirmPassword("");
-    setError("");
-    setSuccessMessage("");
-  };
-
   return (
-    <div className="min-h-screen relative overflow-hidden">
-      {/* 3D Forest Background */}
-      <div
-        className="absolute inset-0 bg-cover bg-center bg-no-repeat"
-        style={{
-          backgroundImage: `url(${FOREST_BG})`,
-          transform: "scale(1.1)",
-        }}
-      />
-
-      {/* Overlay with gradient */}
-      <div className="absolute inset-0 bg-gradient-to-b from-black/40 via-transparent to-black/60" />
-
-      {/* Floating Particles */}
-      <div className="absolute inset-0 overflow-hidden pointer-events-none">
-        {particles.map((particle) => (
-          <div
-            key={particle.id}
-            className="absolute w-2 h-2 rounded-full bg-yellow-400/60 animate-pulse"
-            style={{
-              left: `${particle.x}%`,
-              top: `${particle.y}%`,
-              animationDelay: `${particle.delay}s`,
-              boxShadow: "0 0 10px 2px rgba(255, 215, 0, 0.5)",
-            }}
-          />
-        ))}
-      </div>
-
-      {/* Magical Mist Effect */}
+    <div className="min-h-screen relative bg-gradient-to-b from-[#050408] via-[#0b0710] to-[#030206] flex items-center justify-center overflow-hidden px-4">
+      {/* Background glow */}
       <div className="absolute inset-0 pointer-events-none">
-        <div className="absolute bottom-0 left-0 right-0 h-64 bg-gradient-to-t from-purple-900/30 to-transparent animate-pulse" />
+        <div
+          style={{
+            background:
+              "radial-gradient(circle at 20% 20%, rgba(255,215,0,0.06), transparent 12%), radial-gradient(circle at 80% 80%, rgba(220,38,38,0.04), transparent 15%)",
+          }}
+          className="w-full h-full"
+        />
       </div>
 
-      {/* Main Content */}
-      <div className="relative z-10 min-h-screen flex flex-col items-center justify-center px-4">
+      {/* Center content */}
+      <div className="relative z-10 w-full max-w-4xl flex flex-col items-center gap-6">
         {/* Title */}
-        <div className="text-center mb-8 animate-fade-in">
-          <h1
-            className="text-5xl md:text-7xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 via-amber-500 to-yellow-600 drop-shadow-lg mb-2"
-            style={{ textShadow: "0 0 30px rgba(255, 215, 0, 0.5)" }}
-          >
-            PinoyTV
+        <div className="text-center">
+          <h1 className="text-3xl md:text-5xl font-extrabold bg-clip-text text-transparent bg-gradient-to-r from-yellow-300 via-amber-400 to-yellow-500 drop-shadow-lg">
+            PinoyTV — The Enchanted Library
           </h1>
-          <p className="text-lg md:text-xl text-amber-200/80 font-medium tracking-wider">
-            Your Gateway to Premium Entertainment
-          </p>
+          <p className="text-sm md:text-base text-amber-200/70 mt-1">Choose your path — but unlock first.</p>
         </div>
 
-        {/* Books and Padlock Container */}
-        <div className="flex items-center justify-center gap-4 md:gap-8 lg:gap-16 relative">
-          {/* Devil Book (Signup) */}
-          <div
-            className={`relative cursor-pointer transition-all duration-700 transform hover:scale-105 
-              ${bookAnimation === "devil" ? "animate-book-open scale-110" : ""}
-              ${authMode === "signup" ? "opacity-0 pointer-events-none" : ""}`}
-            onClick={() => handleBookClick("devil")}
-          >
-            <div className="relative group">
-              <img
-                src={DEVIL_BOOK}
-                alt="Devil's Book - Sign Up"
-                className="w-32 h-44 md:w-48 md:h-64 lg:w-56 lg:h-72 object-cover rounded-lg shadow-2xl transition-transform duration-500 group-hover:rotate-y-10"
-                style={{
-                  boxShadow:
-                    "0 0 40px rgba(220, 38, 38, 0.5), 0 20px 40px rgba(0,0,0,0.5)",
-                  filter: "drop-shadow(0 0 20px rgba(220, 38, 38, 0.3))",
-                }}
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-red-900/60 to-transparent rounded-lg opacity-0 group-hover:opacity-100 transition-opacity" />
-              <div className="absolute bottom-2 left-0 right-0 text-center">
-                <span className="text-red-400 font-bold text-sm md:text-base tracking-wider drop-shadow-lg">
-                  SIGN UP
-                </span>
+        {/* Padlock / Question */}
+        {!bookOpen && (
+          <div className="w-full flex flex-col items-center gap-4">
+            <div
+              className={`relative rounded-xl p-6 md:p-8 flex flex-col items-center bg-black/40 border border-white/5 shadow-xl`}
+              style={{ backdropFilter: "blur(6px)" }}
+            >
+              <div className="mb-3">
+                {!unlocked ? (
+                  <img src={PADLOCK} alt="Padlock" className="w-20 h-20 md:w-24 md:h-24" />
+                ) : (
+                  <Unlock className="w-20 h-20 md:w-24 md:h-24 text-yellow-300" />
+                )}
               </div>
-              <div className="absolute -inset-2 bg-red-500/20 rounded-xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity -z-10" />
-            </div>
-          </div>
 
-          {/* Center Padlock */}
-          <div
-            className={`relative cursor-pointer transition-all duration-500 transform 
-              ${isUnlocked ? "scale-90 opacity-50" : "hover:scale-110 animate-bounce-slow"}`}
-            onClick={handlePadlockClick}
-          >
-            <div className="relative">
-              {isUnlocked ? (
-                <Unlock
-                  className="w-16 h-16 md:w-24 md:h-24 text-yellow-400 drop-shadow-lg"
-                  style={{ filter: "drop-shadow(0 0 15px rgba(255, 215, 0, 0.8))" }}
-                />
-              ) : (
-                <img
-                  src={PADLOCK}
-                  alt="Padlock"
-                  className="w-16 h-16 md:w-24 md:h-24 object-contain"
-                  style={{ filter: "drop-shadow(0 0 15px rgba(255, 215, 0, 0.8))" }}
-                />
-              )}
-              {!isUnlocked && (
-                <div className="absolute -inset-4 animate-ping-slow">
-                  <Sparkles className="w-full h-full text-yellow-400/30" />
-                </div>
-              )}
-            </div>
-            <p className="text-center text-yellow-300/80 text-xs md:text-sm mt-2 font-medium">
-              {isUnlocked ? "Unlocked!" : "Click to Unlock"}
-            </p>
-          </div>
-
-          {/* Angel Book (Login) */}
-          <div
-            className={`relative cursor-pointer transition-all duration-700 transform hover:scale-105
-              ${bookAnimation === "angel" ? "animate-book-open scale-110" : ""}
-              ${authMode === "login" ? "opacity-0 pointer-events-none" : ""}`}
-            onClick={() => handleBookClick("angel")}
-          >
-            <div className="relative group">
-              <img
-                src={ANGEL_BOOK}
-                alt="Angel's Book - Login"
-                className="w-32 h-44 md:w-48 md:h-64 lg:w-56 lg:h-72 object-cover rounded-lg shadow-2xl transition-transform duration-500 group-hover:rotate-y-10"
-                style={{
-                  boxShadow:
-                    "0 0 40px rgba(234, 179, 8, 0.5), 0 20px 40px rgba(0,0,0,0.5)",
-                  filter: "drop-shadow(0 0 20px rgba(234, 179, 8, 0.3))",
-                }}
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-yellow-900/60 to-transparent rounded-lg opacity-0 group-hover:opacity-100 transition-opacity" />
-              <div className="absolute bottom-2 left-0 right-0 text-center">
-                <span className="text-yellow-400 font-bold text-sm md:text-base tracking-wider drop-shadow-lg">
-                  LOGIN
-                </span>
-              </div>
-              <div className="absolute -inset-2 bg-yellow-500/20 rounded-xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity -z-10" />
-            </div>
-          </div>
-        </div>
-
-        {/* Instructions */}
-        {!authMode && (
-          <p className="text-amber-200/60 text-sm md:text-base mt-8 text-center max-w-md animate-pulse">
-            Click the padlock to unlock, then choose your book to continue
-          </p>
-        )}
-      </div>
-
-      {/* Question Modal */}
-      {showModal && !isUnlocked && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fade-in">
-          <div
-            className="bg-gradient-to-br from-purple-900 via-purple-800 to-indigo-900 rounded-2xl p-6 md:p-8 max-w-md w-full shadow-2xl border border-purple-500/30 animate-scale-in"
-            style={{ boxShadow: "0 0 60px rgba(147, 51, 234, 0.4)" }}
-          >
-            <div className="text-center">
-              <Sparkles className="w-12 h-12 text-yellow-400 mx-auto mb-4 animate-spin-slow" />
-              <h2 className="text-2xl md:text-3xl font-bold text-yellow-400 mb-6">
-                Mystical Question
+              <h2 className="text-lg md:text-xl font-semibold text-amber-100 mb-2">
+                {unlocked ? "The lock yielded..." : "Mystical Question"}
               </h2>
-              <p className="text-xl md:text-2xl text-white mb-8 font-medium">
-                GamayPototoy ka ba?
-              </p>
+              <p className="text-sm md:text-base text-white/80 mb-4">GamayPototoy ka ba?</p>
 
               {error && (
-                <div className="mb-4 p-3 bg-red-500/20 border border-red-500/50 rounded-lg text-red-300 text-sm animate-shake">
+                <div className="mb-3 px-3 py-2 bg-red-600/20 border border-red-600/40 text-red-200 rounded">
                   {error}
                 </div>
               )}
 
-              <div className="flex gap-4 justify-center">
+              <div className="flex gap-4">
                 <button
-                  onClick={() => handleQuestionAnswer("yes")}
-                  className="px-8 py-3 bg-gradient-to-r from-green-500 to-emerald-600 text-white font-bold rounded-xl hover:from-green-600 hover:to-emerald-700 transition-all transform hover:scale-105 shadow-lg"
-                  style={{ boxShadow: "0 0 20px rgba(34, 197, 94, 0.4)" }}
+                  onClick={() => handleAnswer("yes")}
+                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-green-600 text-white font-semibold shadow"
                 >
                   YES
                 </button>
                 <button
-                  onClick={() => handleQuestionAnswer("no")}
-                  className="px-8 py-3 bg-gradient-to-r from-red-500 to-rose-600 text-white font-bold rounded-xl hover:from-red-600 hover:to-rose-700 transition-all transform hover:scale-105 shadow-lg"
-                  style={{ boxShadow: "0 0 20px rgba(239, 68, 68, 0.4)" }}
+                  onClick={() => handleAnswer("no")}
+                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-red-500 to-rose-600 text-white font-semibold shadow"
                 >
                   NO
                 </button>
               </div>
             </div>
+
+            <p className="text-xs text-amber-200/60">Tap YES to unlock the enchanted book.</p>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Auth Form Modal */}
-      {authMode && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in">
-          <div
-            className={`relative w-full max-w-md rounded-2xl p-6 md:p-8 shadow-2xl border animate-scale-in
-              ${authMode === "login"
-                ? "bg-gradient-to-br from-amber-900 via-yellow-900 to-amber-950 border-yellow-500/30"
-                : "bg-gradient-to-br from-red-900 via-rose-900 to-red-950 border-red-500/30"}`}
-            style={{
-              boxShadow:
-                authMode === "login"
-                  ? "0 0 60px rgba(234, 179, 8, 0.3)"
-                  : "0 0 60px rgba(220, 38, 38, 0.3)",
-            }}
-          >
-            {/* Close Button */}
-            <button
-              onClick={closeAuthForm}
-              className="absolute top-4 right-4 text-white/60 hover:text-white transition-colors"
+        {/* Book */}
+        {bookOpen && (
+          <div className="w-full flex justify-center">
+            <div
+              className="relative perspective"
+              style={{ perspective: "2000px", width: "100%", maxWidth: 980 }}
             >
-              <X className="w-6 h-6" />
-            </button>
-
-            {/* Header */}
-            <div className="text-center mb-6">
-              <h2
-                className={`text-3xl font-bold mb-2 ${
-                  authMode === "login" ? "text-yellow-400" : "text-red-400"
-                }`}
+              {/* Book box: responsive size */}
+              <div
+                className={`book relative mx-auto`}
+                style={{
+                  width: "min(92vw, 860px)",
+                  height: "min(62vw, 520px)",
+                  maxHeight: 560,
+                  transformStyle: "preserve-3d",
+                }}
               >
-                {authMode === "login" ? "Angel's Portal" : "Devil's Gateway"}
-              </h2>
-              <p className="text-white/70">
-                {authMode === "login" ? "Welcome back, traveler" : "Join the dark side"}
-              </p>
-            </div>
-
-            {/* Error Message */}
-            {error && (
-              <div className="mb-4 p-3 bg-red-500/20 border border-red-500/50 rounded-lg text-red-300 text-sm animate-shake">
-                {error}
-              </div>
-            )}
-
-            {/* Success Message */}
-            {successMessage && (
-              <div className="mb-4 p-3 bg-green-600/20 border border-green-600/40 rounded-lg text-green-200 text-sm">
-                {successMessage}
-              </div>
-            )}
-
-            {/* Form */}
-            <form onSubmit={handleSubmit} className="space-y-4">
-              {authMode === "signup" && (
-                <div>
-                  <label className="block text-white/80 text-sm font-medium mb-1">Username</label>
-                  <input
-                    type="text"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    required
-                    className="w-full px-4 py-3 bg-black/30 border border-white/20 rounded-xl text-white placeholder-white/40 focus:outline-none focus:border-white/50 transition-colors"
-                    placeholder="Enter your username"
-                  />
-                </div>
-              )}
-
-              <div>
-                <label className="block text-white/80 text-sm font-medium mb-1">Email</label>
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                    required
-                    className="w-full px-4 py-3 bg-black/30 border border-white/20 rounded-xl text-white placeholder-white/40 focus:outline-none focus:border-white/50 transition-colors"
-                    placeholder="Enter your email"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-white/80 text-sm font-medium mb-1">Password</label>
-                  <div className="relative">
-                    <input
-                      type={showPassword ? "text" : "password"}
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      required
-                      className="w-full px-4 py-3 bg-black/30 border border-white/20 rounded-xl text-white placeholder-white/40 focus:outline-none focus:border-white/50 transition-colors pr-12"
-                      placeholder="Enter your password"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowPassword(!showPassword)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-white/60 hover:text-white"
-                    >
-                      {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                    </button>
-                  </div>
-                </div>
-
-                {authMode === "signup" && (
-                  <div>
-                    <label className="block text-white/80 text-sm font-medium mb-1">Confirm Password</label>
-                    <input
-                      type="password"
-                      value={confirmPassword}
-                      onChange={(e) => setConfirmPassword(e.target.value)}
-                      required
-                      className="w-full px-4 py-3 bg-black/30 border border-white/20 rounded-xl text-white placeholder-white/40 focus:outline-none focus:border-white/50 transition-colors"
-                      placeholder="Confirm your password"
-                    />
-                  </div>
-                )}
-
-                <button
-                  type="submit"
-                  disabled={isLoading}
-                  className={`w-full py-3 rounded-xl font-bold text-white transition-all transform hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed
-                    ${authMode === "login"
-                      ? "bg-gradient-to-r from-yellow-500 to-amber-600 hover:from-yellow-600 hover:to-amber-700"
-                      : "bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700"}`}
+                {/* Pages wrapper (we rotate this to flip) */}
+                <div
+                  className={`pages absolute inset-0 transition-transform duration-900 ease-in-out`}
+                  // flip when currentPage === "signup" so left page is visible (book rotated)
                   style={{
-                    boxShadow:
-                      authMode === "login"
-                        ? "0 0 20px rgba(234, 179, 8, 0.4)"
-                        : "0 0 20px rgba(220, 38, 38, 0.4)",
+                    transform: currentPage === "signup" ? "rotateY(-180deg)" : "rotateY(0deg)",
+                    transformStyle: "preserve-3d",
+                    borderRadius: 16,
+                    overflow: "visible",
                   }}
                 >
-                  {isLoading ? (
-                    <span className="flex items-center justify-center gap-2">
-                      <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                      </svg>
-                      Processing...
-                    </span>
-                  ) : authMode === "login" ? (
-                    "Enter the Light"
-                  ) : (
-                    "Embrace the Darkness"
-                  )}
-                </button>
-              </form>
+                  {/* Left Page (Sign Up) */}
+                  <div
+                    className="page left absolute top-0 left-0 h-full"
+                    style={{
+                      width: "50%",
+                      backgroundImage: `url(${DEVIL_BG})`,
+                      backgroundSize: "cover",
+                      backgroundPosition: "center",
+                      transformOrigin: "right center",
+                      transform: "translateZ(0) rotateY(180deg)",
+                      boxShadow: "inset 0 0 80px rgba(0,0,0,0.6), 0 20px 60px rgba(0,0,0,0.6)",
+                      borderRadius: 12,
+                      overflow: "hidden",
+                    }}
+                  >
+                    {/* subtle overlay */}
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-black/60" />
 
-              {/* Switch Mode */}
-              <div className="mt-6 text-center">
-                <button
-                  onClick={() => {
-                    setAuthMode(authMode === "login" ? "signup" : "login");
-                    setError("");
-                    setSuccessMessage("");
-                  }}
-                  className="text-white/60 hover:text-white text-sm transition-colors"
-                >
-                  {authMode === "login"
-                    ? "Don't have an account? Sign up with the Devil's Book"
-                    : "Already have an account? Login with the Angel's Book"}
-                </button>
+                    <div className="relative z-10 h-full p-6 md:p-8 flex flex-col">
+                      <div className="flex items-start justify-between">
+                        <h3 className="text-lg md:text-2xl font-bold text-red-200 drop-shadow">Devil's Gateway</h3>
+                        <button
+                          onClick={() => {
+                            setBookOpen(false);
+                            resetForms();
+                            setShowQuestion(false);
+                          }}
+                          className="text-white/60 hover:text-white"
+                          aria-label="Close book"
+                        >
+                          <X />
+                        </button>
+                      </div>
+
+                      <form onSubmit={handleSubmit} className="mt-4 flex-1 flex flex-col gap-3">
+                        <label className="text-sm text-white/80">Username</label>
+                        <input
+                          className="rounded-md p-2 bg-black/40 text-white placeholder-white/60 focus:outline-none"
+                          placeholder="Choose a username"
+                          value={username}
+                          onChange={(e) => setUsername(e.target.value)}
+                          required
+                        />
+                        <label className="text-sm text-white/80">Email</label>
+                        <input
+                          type="email"
+                          className="rounded-md p-2 bg-black/40 text-white placeholder-white/60 focus:outline-none"
+                          placeholder="you@example.com"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          required
+                        />
+                        <label className="text-sm text-white/80">Password</label>
+                        <input
+                          type="password"
+                          className="rounded-md p-2 bg-black/40 text-white placeholder-white/60 focus:outline-none"
+                          placeholder="Minimum 6 characters"
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          required
+                        />
+                        <label className="text-sm text-white/80">Confirm Password</label>
+                        <input
+                          type="password"
+                          className="rounded-md p-2 bg-black/40 text-white placeholder-white/60 focus:outline-none"
+                          placeholder="Repeat password"
+                          value={confirmPassword}
+                          onChange={(e) => setConfirmPassword(e.target.value)}
+                          required
+                        />
+
+                        {error && <div className="text-sm text-red-300 mt-1">{error}</div>}
+                        {successMessage && <div className="text-sm text-green-300 mt-1">{successMessage}</div>}
+
+                        <div className="mt-auto">
+                          <button
+                            type="submit"
+                            disabled={isLoading}
+                            className="w-full py-2 rounded-md bg-gradient-to-r from-red-500 to-rose-600 text-white font-semibold"
+                          >
+                            {isLoading ? "Processing..." : "Embrace the Darkness"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => flipTo("login")}
+                            className="mt-3 w-full text-sm text-white/80 underline"
+                          >
+                            Already have an account? Go to Login →
+                          </button>
+                        </div>
+                      </form>
+                    </div>
+                  </div>
+
+                  {/* Right Page (Login) */}
+                  <div
+                    className="page right absolute top-0 right-0 h-full"
+                    style={{
+                      width: "50%",
+                      left: "50%",
+                      backgroundImage: `url(${ANGEL_BG})`,
+                      backgroundSize: "cover",
+                      backgroundPosition: "center",
+                      transformOrigin: "left center",
+                      boxShadow: "inset 0 0 60px rgba(0,0,0,0.45), 0 20px 60px rgba(0,0,0,0.6)",
+                      borderRadius: 12,
+                      overflow: "hidden",
+                    }}
+                  >
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-black/40" />
+                    <div className="relative z-10 h-full p-6 md:p-8 flex flex-col">
+                      <div className="flex items-start justify-between">
+                        <h3 className="text-lg md:text-2xl font-bold text-yellow-50 drop-shadow">Angel's Portal</h3>
+                        <div className="flex items-center gap-3">
+                          <button
+                            onClick={() => {
+                              setBookOpen(false);
+                              resetForms();
+                              setShowQuestion(false);
+                            }}
+                            className="text-white/60 hover:text-white"
+                            aria-label="Close book"
+                          >
+                            <X />
+                          </button>
+                        </div>
+                      </div>
+
+                      <form onSubmit={handleSubmit} className="mt-4 flex-1 flex flex-col gap-3">
+                        <label className="text-sm text-white/90">Email</label>
+                        <input
+                          type="email"
+                          className="rounded-md p-2 bg-black/40 text-white placeholder-white/60 focus:outline-none"
+                          placeholder="you@example.com"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          required
+                        />
+
+                        <label className="text-sm text-white/90">Password</label>
+                        <div className="relative">
+                          <input
+                            type={showPassword ? "text" : "password"}
+                            className="rounded-md p-2 pr-10 bg-black/40 text-white placeholder-white/60 focus:outline-none w-full"
+                            placeholder="Your password"
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            required
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowPassword((s) => !s)}
+                            className="absolute right-2 top-1/2 -translate-y-1/2 text-white/70"
+                            aria-label="Toggle password visibility"
+                          >
+                            {showPassword ? <EyeOff /> : <Eye />}
+                          </button>
+                        </div>
+
+                        {error && <div className="text-sm text-red-300 mt-1">{error}</div>}
+                        <div className="mt-auto">
+                          <button
+                            type="submit"
+                            disabled={isLoading}
+                            className="w-full py-2 rounded-md bg-gradient-to-r from-yellow-400 to-amber-500 text-white font-semibold"
+                          >
+                            {isLoading ? "Signing in..." : "Enter the Light"}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => flipTo("signup")}
+                            className="mt-3 w-full text-sm text-white/80 underline"
+                          >
+                            Don't have an account? Sign up with the Devil's Book →
+                          </button>
+                        </div>
+                      </form>
+                    </div>
+                  </div>
+
+                  {/* Particles layer between pages */}
+                  <div
+                    aria-hidden
+                    className="particles absolute top-0 left-0 w-full h-full pointer-events-none"
+                    style={{ zIndex: 15 }}
+                  >
+                    {particles.map((p) => (
+                      <span
+                        key={p.id}
+                        style={{
+                          position: "absolute",
+                          left: `${p.left}%`,
+                          top: `${p.top}%`,
+                          width: `${p.size}px`,
+                          height: `${p.size}px`,
+                          borderRadius: "999px",
+                          background:
+                            currentPage === "signup"
+                              ? "radial-gradient(circle, rgba(255,120,120,0.95), rgba(255,40,40,0.4))"
+                              : "radial-gradient(circle, rgba(255,230,120,0.95), rgba(255,200,70,0.35))",
+                          boxShadow:
+                            "0 0 10px rgba(255,255,255,0.08), 0 0 18px rgba(255,255,255,0.04)",
+                          opacity: 0.9,
+                          animation: `floatUp 6s infinite ${p.delay}s linear`,
+                          transform: "translateY(0)",
+                          zIndex: 16,
+                        }}
+                      />
+                    ))}
+                  </div>
+
+                  {/* Page curl visual on the turning edge (right inner) */}
+                  <div
+                    className="page-curl absolute top-0 left-[48%] h-full"
+                    style={{ width: "6%", zIndex: 20, pointerEvents: "none" }}
+                  />
+                </div>
               </div>
             </div>
           </div>
         )}
+      </div>
 
-      {/* Custom Animations */}
+      {/* Inline Styles & Animations */}
       <style>{`
-        @keyframes fade-in {
-          from { opacity: 0; }
-          to { opacity: 1; }
+        /* Responsive helpers */
+        @media (max-width: 768px) {
+          .page { padding: 16px !important; }
         }
-        @keyframes scale-in {
-          from { opacity: 0; transform: scale(0.9); }
-          to { opacity: 1; transform: scale(1); }
+
+        /* Pages (front/back surfaces mimic book pages) */
+        .pages .page::after {
+          /* subtle paper edge */
+          content: "";
+          position: absolute;
+          inset: 0;
+          box-shadow: inset 0 0 0 2px rgba(255,255,255,0.02);
+          pointer-events: none;
         }
-        @keyframes book-open {
-          0% { transform: perspective(1000px) rotateY(0deg); }
-          50% { transform: perspective(1000px) rotateY(-30deg); }
-          100% { transform: perspective(1000px) rotateY(0deg) scale(1.1); }
+
+        /* Page curl simulation - uses gradient & transform to fake curl */
+        .page-curl::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          background:
+            linear-gradient(90deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.04) 40%, rgba(0,0,0,0.15) 100%);
+          transform-origin: left center;
+          transition: transform 0.9s cubic-bezier(.2,.9,.3,1), opacity 0.6s;
+          opacity: 0.9;
         }
-        @keyframes bounce-slow {
-          0%, 100% { transform: translateY(0); }
-          50% { transform: translateY(-10px); }
+
+        /* When on signup, the pages rotate so curl animates naturally */
+        .pages[style*="rotateY(-180deg)"] .page-curl::before {
+          transform: rotateY(180deg) scaleX(-1);
+          opacity: 1;
         }
-        @keyframes ping-slow {
-          0% { transform: scale(1); opacity: 1; }
-          75%, 100% { transform: scale(1.5); opacity: 0; }
+
+        /* Particle animation */
+        @keyframes floatUp {
+          0% { transform: translateY(0) scale(0.9); opacity: 0; }
+          10% { opacity: 1; }
+          50% { transform: translateY(-10px) scale(1.05); opacity: 0.95; }
+          100% { transform: translateY(-60px) scale(0.8); opacity: 0; }
         }
-        @keyframes spin-slow {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
+
+        /* Smooth flip (slight page bend while flipping) */
+        .pages {
+          will-change: transform;
+          perspective: 2000px;
         }
-        @keyframes shake {
-          0%, 100% { transform: translateX(0); }
-          25% { transform: translateX(-5px); }
-          75% { transform: translateX(5px); }
+
+        /* Tiny 3D tilt when switching pages for realism */
+        .pages[style*="rotateY(-180deg)"] {
+          box-shadow: -40px 40px 80px rgba(0,0,0,0.6), inset -10px 0 40px rgba(0,0,0,0.2);
         }
-        .animate-fade-in { animation: fade-in 0.3s ease-out; }
-        .animate-scale-in { animation: scale-in 0.4s ease-out; }
-        .animate-book-open { animation: book-open 0.8s ease-in-out; }
-        .animate-bounce-slow { animation: bounce-slow 2s ease-in-out infinite; }
-        .animate-ping-slow { animation: ping-slow 2s cubic-bezier(0, 0, 0.2, 1) infinite; }
-        .animate-spin-slow { animation: spin-slow 3s linear infinite; }
-        .animate-shake { animation: shake 0.5s ease-in-out; }
+
+        .pages[style*="rotateY(0deg)"] {
+          box-shadow: 40px 40px 80px rgba(0,0,0,0.6), inset 10px 0 40px rgba(0,0,0,0.2);
+        }
+
+        /* small accessibility: disable pointer events during flip */
+        .pages[style*="rotateY(-180deg)"], .pages[style*="rotateY(0deg)"] {
+          pointer-events: auto;
+        }
+
+        /* A gentle entrance */
+        .book { animation: bookEntrance 420ms cubic-bezier(.2,.9,.3,1) both; }
+        @keyframes bookEntrance {
+          from { transform: translateY(20px) scale(0.98); opacity: 0; }
+          to { transform: translateY(0) scale(1); opacity: 1; }
+        }
       `}</style>
     </div>
   );
