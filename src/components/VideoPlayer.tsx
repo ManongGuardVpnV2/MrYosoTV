@@ -101,7 +101,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const hlsRef = useRef<any>(null);
   
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isMuted, setIsMuted] = useState(false);
+  const [isMuted, setIsMuted] = useState(true); // start true to match autoplay-muted behavior
   const [volume, setVolume] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -144,6 +144,38 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     };
 
     loadScripts();
+  }, []);
+
+  // Auto-unlock audio on first user gesture (mousemove / touchstart / click / keydown)
+  useEffect(() => {
+    const unlockAudio = () => {
+      const v = videoRef.current;
+      if (!v) return;
+      if (v.muted) {
+        try {
+          v.muted = false;
+        } catch {}
+        setIsMuted(false);
+      }
+      // clean up listeners (they were added with { once: true } but remove just in case)
+      window.removeEventListener('mousemove', unlockAudio);
+      window.removeEventListener('touchstart', unlockAudio);
+      window.removeEventListener('click', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
+
+    // Listen once for each allowed gesture (passive where appropriate)
+    window.addEventListener('mousemove', unlockAudio, { once: true, passive: true } as any);
+    window.addEventListener('touchstart', unlockAudio, { once: true, passive: true } as any);
+    window.addEventListener('click', unlockAudio, { once: true, passive: true } as any);
+    window.addEventListener('keydown', unlockAudio, { once: true, passive: true } as any);
+
+    return () => {
+      window.removeEventListener('mousemove', unlockAudio);
+      window.removeEventListener('touchstart', unlockAudio);
+      window.removeEventListener('click', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
   }, []);
 
   // Cleanup function
@@ -189,6 +221,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       cleanup();
 
       const video = videoRef.current!;
+
+      // Ensure autoplay starts muted and React state reflects that
+      try {
+        video.muted = true;
+      } catch {}
+      setIsMuted(true);
 
       try {
         // first: attempt to play ad if present and not yet played
@@ -374,13 +412,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const playDirect = async (video: HTMLVideoElement, url: string) => {
     // Optimize: allow immediate preload and muted autoplay attempt to reduce delay
     video.preload = 'auto';
-    video.muted = true; // attempt autoplay
+    try { video.muted = true; } catch {}
+    setIsMuted(true);
     video.src = url;
     await video.play().catch(e => console.warn('Direct play error', e));
-    // restore muted state to UI preference if needed
-    if (!isMuted) {
-      try { video.muted = false; } catch {}
-    }
+    // restore muted state to UI preference if needed (we keep autoplay-muted; unmute unlocked via gesture)
+    // Do not programmatically unmute here — browsers will block it if no gesture
   };
 
   // Load HLS: tuned for low latency + robust error recovery
@@ -390,9 +427,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       if (video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = ch.stream_url;
         video.preload = 'auto';
-        video.muted = true;
+        try { video.muted = true; } catch {}
+        setIsMuted(true);
         await video.play().catch(()=>{});
-        if (!isMuted) video.muted = false;
         return;
       }
       throw new Error('HLS not supported');
@@ -431,7 +468,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
     // attempt immediate autoplay via muted trick (improves "no autoplay" on some browsers)
     video.preload = 'auto';
-    video.muted = true;
+    try { video.muted = true; } catch {}
+    setIsMuted(true);
     try { await video.play().catch(()=>{}); } catch {}
 
     // HLS event handlers - populate qualities and add robust error recovery
@@ -612,9 +650,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     try {
       await player.load(ch.stream_url);
       video.preload = 'auto';
-      video.muted = true;
+      try { video.muted = true; } catch {}
+      setIsMuted(true);
       await video.play().catch(()=>{});
-      if (!isMuted) video.muted = false;
     } catch (e) {
       console.error('Shaka load/play failed', e);
       setError('Failed to load DASH stream');
@@ -716,6 +754,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       } else {
         // Some browsers block autoplay if not muted; attempt play and swallow errors
         if (videoRef.current.paused) {
+          // If user explicitly clicks play, treat it as a gesture — allow unmuting if desired
+          try {
+            // Only unmute on explicit click if we want that behavior; keep commented if you prefer only mousemove/touch
+            // if (videoRef.current.muted) { videoRef.current.muted = false; setIsMuted(false); }
+          } catch {}
+
           videoRef.current.play().catch(()=>{});
         }
       }
