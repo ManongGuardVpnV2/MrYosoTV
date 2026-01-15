@@ -101,7 +101,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const hlsRef = useRef<any>(null);
   
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isMuted, setIsMuted] = useState(true); // start true to match autoplay-muted behavior
+  const [isMuted, setIsMuted] = useState(false); // start true to match autoplay-muted behavior
   const [volume, setVolume] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -224,9 +224,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
       // Ensure autoplay starts muted and React state reflects that
       try {
-        video.muted = true;
+        video.muted = false;
       } catch {}
-      setIsMuted(true);
+      setIsMuted(false);
 
       try {
         // first: attempt to play ad if present and not yet played
@@ -412,8 +412,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const playDirect = async (video: HTMLVideoElement, url: string) => {
     // Optimize: allow immediate preload and muted autoplay attempt to reduce delay
     video.preload = 'auto';
-    try { video.muted = true; } catch {}
-    setIsMuted(true);
+    try { video.muted = false; } catch {}
+    setIsMuted(false);
     video.src = url;
     await video.play().catch(e => console.warn('Direct play error', e));
     // restore muted state to UI preference if needed (we keep autoplay-muted; unmute unlocked via gesture)
@@ -427,8 +427,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       if (video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = ch.stream_url;
         video.preload = 'auto';
-        try { video.muted = true; } catch {}
-        setIsMuted(true);
+        try { video.muted = false; } catch {}
+        setIsMuted(false);
         await video.play().catch(()=>{});
         return;
       }
@@ -468,8 +468,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
     // attempt immediate autoplay via muted trick (improves "no autoplay" on some browsers)
     video.preload = 'auto';
-    try { video.muted = true; } catch {}
-    setIsMuted(true);
+    try { video.muted = false; } catch {}
+    setIsMuted(false);
     try { await video.play().catch(()=>{}); } catch {}
 
     // HLS event handlers - populate qualities and add robust error recovery
@@ -650,8 +650,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     try {
       await player.load(ch.stream_url);
       video.preload = 'auto';
-      try { video.muted = true; } catch {}
-      setIsMuted(true);
+      try { video.muted = false; } catch {}
+      setIsMuted(false);
       await video.play().catch(()=>{});
     } catch (e) {
       console.error('Shaka load/play failed', e);
