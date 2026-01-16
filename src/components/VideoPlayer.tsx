@@ -1041,7 +1041,7 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
                   title={isStreamEnabled ? 'Turn stream off' : 'Turn stream on'}
                 >
                   <span className={`w-2 h-2 rounded-full ${isStreamEnabled ? 'bg-emerald-400' : 'bg-red-400'} block`} />
-                  <span className="hidden md:inline">{isStreamEnabled ? 'On Stream' : 'Off'}</span>
+                  
                 </button>
               </div>
 
