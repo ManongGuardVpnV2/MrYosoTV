@@ -978,69 +978,7 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
             <div className="flex items-center gap-2 md:gap-4">
               {/* Channel Navigation */}
               {onChannelChange && (
-                <button
-                  onClick={() => onChannelChange('prev')}
-                  className="p-2 text-amber-200 hover:text-amber-400 transition-colors"
-                >
-                  <SkipBack className="w-5 h-5" />
-                </button>
-              )}
-
-              {/* Play/Pause */}
-              <button
-                onClick={togglePlay}
-                className="p-2 bg-amber-600/50 rounded-full text-amber-100 hover:bg-amber-600 transition-colors"
-              >
-                {isPlaying ? <Pause className="w-5 h-5 md:w-6 md:h-6" /> : <Play className="w-5 h-5 md:w-6 md:h-6" />}
-              </button>
-
-              {onChannelChange && (
-                <button
-                  onClick={() => onChannelChange('next')}
-                  className="p-2 text-amber-200 hover:text-amber-400 transition-colors"
-                >
-                  <SkipForward className="w-5 h-5" />
-                </button>
-              )}
-
-              {/* Volume */}
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={toggleMute}
-                  className="p-2 text-amber-200 hover:text-amber-400 transition-colors"
-                >
-                  {isMuted || volume === 0 ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
-                </button>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.1}
-                  value={isMuted ? 0 : volume}
-                  onChange={handleVolumeChange}
-                  className="w-16 md:w-24 h-1 appearance-none cursor-pointer rounded-full hidden sm:block"
-                  style={{
-                    background: `linear-gradient(to right, #fbbf24 0%, #fbbf24 ${(isMuted ? 0 : volume) * 100}%, #5d4037 ${(isMuted ? 0 : volume) * 100}%, #5d4037 100%)`
-                  }}
-                />
-              </div>
-
-              {/* Time Display */}
-              <span className="text-amber-200 text-xs md:text-sm font-mono hidden sm:block">
-                {formatTime(currentTime)} / {formatTime(duration)}
-              </span>
-            </div>
-
-            <div className="flex items-center gap-2">
-              {/* NEW: On Stream indicator (left of settings) */}
-              <button
-                  onClick={toggleStreamEnabled}
-                  className="p-2 text-amber-200 hover:text-amber-400 transition-colors"
-                  aria-pressed={isStreamEnabled}
-                  title={isStreamEnabled ? 'Turn stream off' : 'Turn stream on'}
-                >
-                  <Power className={`w-5 h-5 ${isStreamEnabled ? 'text-emerald-400' : 'text-red-400'}`} />
-                </button>
+                
 
               {/* Quality Settings */}
               <div className="relative">
