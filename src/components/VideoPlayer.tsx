@@ -997,15 +997,15 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
                       <button
                         key={q}
                         onClick={() => handleQualityChange(q)}
-                        className={`w-full px-3 py-2 text-left text-sm transition-colors ${
-                          quality === q ? 'bg-amber-600 text-white' : 'text-amber-200 hover:bg-amber-800'
-                        }`}
+                        className={`w-full px-3 py-2 text-left text-sm transition-colors ${quality === q ? 'bg-amber-600 text-white' : 'text-amber-200 hover:bg-amber-800'}`}
                       >
                         {q}
                       </button>
                     ))}
                   </div>
                 )}
+              </div>
+            )}
               </div>
 
               {/* Fullscreen */}
