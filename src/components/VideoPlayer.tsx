@@ -1,5 +1,6 @@
+
 import React, { useEffect, useRef, useState, useCallback } from 'react'; 
-import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, SkipBack, SkipForward, Power } from 'lucide-react';
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, SkipBack, SkipForward } from 'lucide-react';
 import { Channel } from '@/types';
 
 interface VideoPlayerProps {
@@ -114,9 +115,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const [availableQualities, setAvailableQualities] = useState<string[]>(['auto']);
   const [isAdPlaying, setIsAdPlaying] = useState(false);
 
-  // NEW: Stream enabled (On/Off)
-  const [isStreamEnabled, setIsStreamEnabled] = useState(true);
-
   const controlsTimeoutRef = useRef<NodeJS.Timeout>();
   const adPlayedRef = useRef(false);
 
@@ -204,25 +202,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     }
     setError(null);
     setAvailableQualities(['auto']);
-    setIsPlaying(false);
-    setIsAdPlaying(false);
   }, []);
 
   // Reset ad flag when channel changes
   useEffect(() => {
     adPlayedRef.current = false;
-    // If a new channel arrives, re-enable stream by default
-    setIsStreamEnabled(true);
   }, [channel?.stream_url]);
 
-  // Load channel (with ad support) - respects isStreamEnabled
+  // Load channel (with ad support)
   useEffect(() => {
     if (!channel || !videoRef.current) {
-      cleanup();
-      return;
-    }
-
-    if (!isStreamEnabled) {
       cleanup();
       return;
     }
@@ -262,7 +251,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
     return cleanup;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [channel, isStreamEnabled]);
+  }, [channel]);
 
   // Play the ad (supports MP4 or M3U8 proxied URLs)
   const playAd = async (video: HTMLVideoElement, adUrl: string) => {
@@ -346,6 +335,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
         return PROXY_BASE + encodeURIComponent(url);
       }
 
+      // If the origin differs and you still want to route through proxy for CORS, uncomment next line
+      // return PROXY_BASE + encodeURIComponent(url);
+
       return url;
     } catch (e) {
       return url;
@@ -378,7 +370,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
         const text = await r.text();
         if (text.startsWith('#EXTM3U')) return 'hls';
         if (text.includes('<MPD')) return 'dash';
-        if (text.length > 0 && /\<!DOCTYPE html\>|<html/i.test(text)) return 'unknown';
+        if (text.length > 0 && /\<\!DOCTYPE html\>|<html/i.test(text)) return 'unknown';
       } catch (e) {
         // ignore
       }
@@ -785,6 +777,12 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
       } else {
         // Some browsers block autoplay if not muted; attempt play and swallow errors
         if (videoRef.current.paused) {
+          // If user explicitly clicks play, treat it as a gesture — allow unmuting if desired
+          try {
+            // Only unmute on explicit click if we want that behavior; keep commented if you prefer only mousemove/touch
+            // if (videoRef.current.muted) { videoRef.current.muted = false; setIsMuted(false); }
+          } catch {}
+
           videoRef.current.play().catch(()=>{});
         }
       }
@@ -857,21 +855,6 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
           shakaPlayerRef.current.selectVariantTrack(track, true);
         }
       }
-    }
-  };
-
-  // Stream On/Off toggle handler
-  const toggleStreamEnabled = () => {
-    if (isStreamEnabled) {
-      // turn off: immediately cleanup and keep overlay visible
-      cleanup();
-      setIsStreamEnabled(false);
-      setShowControls(true);
-    } else {
-      // turn on: enable and allow useEffect to load channel
-      setIsStreamEnabled(true);
-      // keep controls visible so user sees loading
-      setShowControls(true);
     }
   };
 
@@ -978,8 +961,60 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
             <div className="flex items-center gap-2 md:gap-4">
               {/* Channel Navigation */}
               {onChannelChange && (
-                
+                <button
+                  onClick={() => onChannelChange('prev')}
+                  className="p-2 text-amber-200 hover:text-amber-400 transition-colors"
+                >
+                  <SkipBack className="w-5 h-5" />
+                </button>
+              )}
 
+              {/* Play/Pause */}
+              <button
+                onClick={togglePlay}
+                className="p-2 bg-amber-600/50 rounded-full text-amber-100 hover:bg-amber-600 transition-colors"
+              >
+                {isPlaying ? <Pause className="w-5 h-5 md:w-6 md:h-6" /> : <Play className="w-5 h-5 md:w-6 md:h-6" />}
+              </button>
+
+              {onChannelChange && (
+                <button
+                  onClick={() => onChannelChange('next')}
+                  className="p-2 text-amber-200 hover:text-amber-400 transition-colors"
+                >
+                  <SkipForward className="w-5 h-5" />
+                </button>
+              )}
+
+              {/* Volume */}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={toggleMute}
+                  className="p-2 text-amber-200 hover:text-amber-400 transition-colors"
+                >
+                  {isMuted || volume === 0 ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.1}
+                  value={isMuted ? 0 : volume}
+                  onChange={handleVolumeChange}
+                  className="w-16 md:w-24 h-1 appearance-none cursor-pointer rounded-full hidden sm:block"
+                  style={{
+                    background: `linear-gradient(to right, #fbbf24 0%, #fbbf24 ${(isMuted ? 0 : volume) * 100}%, #5d4037 ${(isMuted ? 0 : volume) * 100}%, #5d4037 100%)`
+                  }}
+                />
+              </div>
+
+              {/* Time Display */}
+              <span className="text-amber-200 text-xs md:text-sm font-mono hidden sm:block">
+                {formatTime(currentTime)} / {formatTime(duration)}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2">
               {/* Quality Settings */}
               <div className="relative">
                 <button
@@ -989,7 +1024,7 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
                   <Settings className="w-5 h-5" />
                 </button>
                 {showSettings && (
-                  <div className="absolute bottom-full right-0 mb-2 bg-amber-900/95 rounded-lg shadow-xl border border-amber-700 overflow-hidden min-w-[120px] sm:min-w-[160px]">
+                  <div className="absolute bottom-full right-0 mb-2 bg-amber-900/95 rounded-lg shadow-xl border border-amber-700 overflow-hidden min-w-[120px]">
                     <div className="px-3 py-2 border-b border-amber-700 text-amber-200 text-xs font-medium">
                       Quality
                     </div>
@@ -997,15 +1032,15 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
                       <button
                         key={q}
                         onClick={() => handleQualityChange(q)}
-                        className={`w-full px-3 py-2 text-left text-sm transition-colors ${quality === q ? 'bg-amber-600 text-white' : 'text-amber-200 hover:bg-amber-800'}`}
+                        className={`w-full px-3 py-2 text-left text-sm transition-colors ${
+                          quality === q ? 'bg-amber-600 text-white' : 'text-amber-200 hover:bg-amber-800'
+                        }`}
                       >
                         {q}
                       </button>
                     ))}
                   </div>
                 )}
-              </div>
-            )}
               </div>
 
               {/* Fullscreen */}
@@ -1014,15 +1049,6 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
                 className="p-2 text-amber-200 hover:text-amber-400 transition-colors"
               >
                 {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
-              </button>
-
-              {/* Power (explicit shutdown) - visible on md+ to avoid crowding mobile */}
-              <button
-                onClick={() => { toggleStreamEnabled(); /* keep same handler but a clearer affordance */ }}
-                className="hidden md:inline-flex items-center p-2 ml-1 text-amber-200 hover:text-amber-400 transition-colors"
-                title={isStreamEnabled ? 'Shutdown stream' : 'Start stream'}
-              >
-                <Power className="w-5 h-5" />
               </button>
             </div>
           </div>
