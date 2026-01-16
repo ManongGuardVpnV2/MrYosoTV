@@ -1,3 +1,4 @@
+
 import React, { useEffect, useRef, useState, useCallback } from 'react'; 
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, SkipBack, SkipForward } from 'lucide-react';
 import { Channel } from '@/types';
@@ -114,9 +115,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const [availableQualities, setAvailableQualities] = useState<string[]>(['auto']);
   const [isAdPlaying, setIsAdPlaying] = useState(false);
 
-  // NEW: device detection state (phone, tablet, desktop, tv)
-  const [deviceType, setDeviceType] = useState<'phone' | 'tablet' | 'desktop' | 'tv'>('desktop');
-
   const controlsTimeoutRef = useRef<NodeJS.Timeout>();
   const adPlayedRef = useRef(false);
 
@@ -179,28 +177,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       window.removeEventListener('click', unlockAudio);
       window.removeEventListener('keydown', unlockAudio);
     };
-  }, []);
-
-  // NEW: detect device type (very lightweight heuristic)
-  useEffect(() => {
-    const ua = navigator.userAgent || '';
-    const isTV = /(SMART-TV|SmartTV|HbbTV|NetCast|Tizen|Roku|BRAVIA|Android TV|AppleTV|CrKey|GoogleTV)/i.test(ua) || (navigator.userAgentData && (navigator.userAgentData.platform || '').toLowerCase().includes('tv'));
-    const isAndroid = /Android/i.test(ua);
-    const isTablet = /iPad|Tablet|PlayBook|Silk|Kindle|SM-T|GT-P/i.test(ua) || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1 && window.innerWidth >= 768 && window.innerWidth <= 1024);
-    const isMobile = /Mobi|iPhone|Android.*Mobile|Windows Phone/i.test(ua) && !isTablet;
-
-    if (isTV) setDeviceType('tv');
-    else if (isTablet) setDeviceType('tablet');
-    else if (isMobile) setDeviceType('phone');
-    else setDeviceType('desktop');
-
-    // Also update on resize/orientation change to react to e.g. connecting to TV or rotating phone
-    const onResize = () => {
-      const width = window.innerWidth;
-      if (width >= 1920) setDeviceType(d => d === 'tv' ? 'tv' : 'desktop');
-    };
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
   }, []);
 
   // Cleanup function
@@ -763,24 +739,27 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     }, 3000);
   }, [isPlaying]);
 
-  // NEW: attach pointer/touch listeners for mobile smooth show/hide
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
+// NEW: attach pointer/touch listeners for mobile smooth show/hide
+useEffect(() => {
+const el = containerRef.current;
+if (!el) return;
 
-    const onTouch = (e: Event) => {
-      // touch is a gesture that should reveal controls briefly
-      showControlsTemporarily();
-    };
 
-    el.addEventListener('touchstart', onTouch, { passive: true });
-    el.addEventListener('pointermove', showControlsTemporarily as any, { passive: true });
+const onTouch = (e: Event) => {
+// touch is a gesture that should reveal controls briefly
+showControlsTemporarily();
+};
 
-    return () => {
-      el.removeEventListener('touchstart', onTouch as any);
-      el.removeEventListener('pointermove', showControlsTemporarily as any);
-    };
-  }, [showControlsTemporarily]);
+
+el.addEventListener('touchstart', onTouch, { passive: true });
+el.addEventListener('pointermove', showControlsTemporarily as any, { passive: true });
+
+
+return () => {
+el.removeEventListener('touchstart', onTouch as any);
+el.removeEventListener('pointermove', showControlsTemporarily as any);
+};
+}, [showControlsTemporarily]);
 
   // Fullscreen handling
   useEffect(() => {
@@ -902,49 +881,24 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     );
   }
 
-  // Compute responsive container style (only modifying the container/video presentation)
-  const baseContainerStyle: React.CSSProperties = {
-    boxShadow: '0 0 30px rgba(0,0,0,0.8), inset 0 0 60px rgba(139, 69, 19, 0.3)',
-    border: '4px solid #5d4037',
-    backgroundImage: 'linear-gradient(45deg, #3e2723 25%, transparent 25%), linear-gradient(-45deg, #3e2723 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #3e2723 75%), linear-gradient(-45deg, transparent 75%, #3e2723 75%)',
-    backgroundSize: '20px 20px',
-    backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px'
-  };
-
-  // Responsive adjustments based on detected device type
-  const containerResponsiveStyle: React.CSSProperties = (() => {
-    switch (deviceType) {
-      case 'tv':
-        // For TVs prefer to fill the screen if possible
-        return { width: '100vw', height: '100vh', maxWidth: '100%', maxHeight: '100vh' };
-      case 'phone':
-        // For phones, take full width and keep a comfortable max height
-        return { width: '100%', maxWidth: '100%', height: 'auto' };
-      case 'tablet':
-        return { width: '100%', maxWidth: '100%', height: 'auto' };
-      case 'desktop':
-      default:
-        return { width: '100%', maxWidth: '1200px', margin: '0 auto', height: 'auto' };
-    }
-  })();
-
-  // video objectFit based on device: TV -> cover (fullscreen), others -> contain
-  const videoObjectFit = deviceType === 'tv' ? 'cover' : 'contain';
-
   return (
     <div 
       ref={containerRef}
       className="relative w-full aspect-video bg-black rounded-lg overflow-hidden group"
       onMouseMove={showControlsTemporarily}
       onMouseLeave={() => isPlaying && setShowControls(false)}
-      onTouchStart={showControlsTemporarily}
-      style={{ ...baseContainerStyle, ...containerResponsiveStyle }}
+      style={{ 
+        boxShadow: '0 0 30px rgba(0,0,0,0.8), inset 0 0 60px rgba(139, 69, 19, 0.3)',
+        border: '4px solid #5d4037',
+        backgroundImage: 'linear-gradient(45deg, #3e2723 25%, transparent 25%), linear-gradient(-45deg, #3e2723 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #3e2723 75%), linear-gradient(-45deg, transparent 75%, #3e2723 75%)',
+        backgroundSize: '20px 20px',
+        backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px'
+      }}
     >
       {/* Video Element */}
       <video
         ref={videoRef}
-        className="w-full h-full"
-        style={{ objectFit: videoObjectFit }}
+        className="w-full h-full object-contain"
         playsInline
         onClick={togglePlay}
       />
