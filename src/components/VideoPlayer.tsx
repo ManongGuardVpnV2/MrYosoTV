@@ -1033,17 +1033,14 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
 
             <div className="flex items-center gap-2">
               {/* NEW: On Stream indicator (left of settings) */}
-              <div className="flex items-center gap-2 mr-1">
-                <button
+              <button
                   onClick={toggleStreamEnabled}
-                  className={`flex items-center gap-2 px-2 py-1 rounded-md text-sm font-medium transition-all ${isStreamEnabled ? 'bg-emerald-700/80 text-emerald-100' : 'bg-red-800/80 text-red-200'}`}
+                  className="p-2 text-amber-200 hover:text-amber-400 transition-colors"
                   aria-pressed={isStreamEnabled}
                   title={isStreamEnabled ? 'Turn stream off' : 'Turn stream on'}
                 >
-                  <span className={`w-2 h-2 rounded-full ${isStreamEnabled ? 'bg-emerald-400' : 'bg-red-400'} block`} />
-                  
+                  <Power className={`w-5 h-5 ${isStreamEnabled ? 'text-emerald-400' : 'text-red-400'}`} />
                 </button>
-              </div>
 
               {/* Quality Settings */}
               <div className="relative">
