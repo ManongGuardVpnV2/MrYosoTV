@@ -7,7 +7,7 @@ interface VideoPlayerProps {
   onChannelChange?: (direction: 'prev' | 'next') => void;
 }
 
-// (loading spinner and StaticNoise unchanged except minor accessibility tweaks)
+// Loading spinner component
 const LoadingSpinner: React.FC = () => (
   <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-20">
     <div className="flex gap-1 mb-4">
@@ -25,7 +25,8 @@ const LoadingSpinner: React.FC = () => (
       ))}
     </div>
     <p className="text-amber-200/60 text-sm animate-pulse">please wait...</p>
-    <div className="absolute bottom-0 left-0 right-0 h-32 overflow-hidden opacity-30" aria-hidden>
+    {/* Roots effect */}
+    <div className="absolute bottom-0 left-0 right-0 h-32 overflow-hidden opacity-30">
       <svg viewBox="0 0 400 100" className="w-full h-full">
         <path d="M0,100 Q50,50 100,80 T200,60 T300,70 T400,50 L400,100 Z" fill="url(#rootGradient)" />
         <path d="M0,100 Q80,60 150,90 T250,70 T350,80 T400,60 L400,100 Z" fill="url(#rootGradient2)" />
@@ -44,6 +45,7 @@ const LoadingSpinner: React.FC = () => (
   </div>
 );
 
+// Static noise component
 const StaticNoise: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -55,17 +57,9 @@ const StaticNoise: React.FC = () => {
 
     let animationId: number;
     const drawNoise = () => {
-      // keep canvas pixel size in sync with displayed size for crispness
-      const ratio = window.devicePixelRatio || 1;
-      const w = canvas.clientWidth * ratio;
-      const h = canvas.clientHeight * ratio;
-      if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-      }
-
       const imageData = ctx.createImageData(canvas.width, canvas.height);
       const data = imageData.data;
+      
       for (let i = 0; i < data.length; i += 4) {
         const value = Math.random() * 255;
         data[i] = value;
@@ -73,7 +67,7 @@ const StaticNoise: React.FC = () => {
         data[i + 2] = value;
         data[i + 3] = 255;
       }
-
+      
       ctx.putImageData(imageData, 0, 0);
       animationId = requestAnimationFrame(drawNoise);
     };
@@ -83,7 +77,7 @@ const StaticNoise: React.FC = () => {
   }, []);
 
   return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900" role="status" aria-live="polite">
+    <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900">
       <canvas 
         ref={canvasRef} 
         width={200} 
@@ -98,10 +92,7 @@ const StaticNoise: React.FC = () => {
   );
 };
 
-const PROXY_BASE = 'https://poohlover.serv00.net/stream-proxy.php?url=';
-
-// Device types we use for responsive decisions
-type DeviceType = 'mobile' | 'tablet' | 'desktop' | 'tv' | 'android-phone' | 'android-tablet';
+const PROXY_BASE = 'https://poohlover.serv00.net/stream-proxy.php?url='; // Your unified proxy endpoint
 
 const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -110,7 +101,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const hlsRef = useRef<any>(null);
   
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isMuted, setIsMuted] = useState(false);
+  const [isMuted, setIsMuted] = useState(false); // start true to match autoplay-muted behavior
   const [volume, setVolume] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -122,169 +113,708 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const [showSettings, setShowSettings] = useState(false);
   const [availableQualities, setAvailableQualities] = useState<string[]>(['auto']);
   const [isAdPlaying, setIsAdPlaying] = useState(false);
-  const [deviceType, setDeviceType] = useState<DeviceType>('desktop');
 
-  const controlsTimeoutRef = useRef<number | undefined>(undefined);
+  // NEW: device detection state (phone, tablet, desktop, tv)
+  const [deviceType, setDeviceType] = useState<'phone' | 'tablet' | 'desktop' | 'tv'>('desktop');
+
+  const controlsTimeoutRef = useRef<NodeJS.Timeout>();
   const adPlayedRef = useRef(false);
-  const lastPointerTypeRef = useRef<string | null>(null);
 
-  // WATCHDOG and other refs unchanged from original (omitted here for brevity in this summary code block) --- keep your existing implementations where necessary
+  // WATCHDOG: detect freeze / stall
   const lastProgressRef = useRef<{ time: number; currentTime: number }>({ time: Date.now(), currentTime: 0 });
   const watchdogIntervalRef = useRef<number | null>(null);
 
-  // ... (dynamic script loading, autoplay unlock, cleanup, ad handling, HLS/Shaka logic etc.)
-  // To keep this file concise but still complete, we'll preserve the bulk of your original logic for streams and error handling.
-  // The main additions are: device detection, responsive/container adjustments, ResizeObserver, and refined pointer/touch control hide behavior.
+  // Load Shaka Player and HLS.js dynamically
+  useEffect(() => {
+    const loadScripts = async () => {
+      // Load Shaka Player
+      if (!window.shaka) {
+        const shakaScript = document.createElement('script');
+        shakaScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.7.11/shaka-player.compiled.min.js';
+        shakaScript.async = true;
+        document.head.appendChild(shakaScript);
+        await new Promise(resolve => shakaScript.onload = resolve);
+      }
 
-  // Device detection helper
-  const detectDeviceType = useCallback((): DeviceType => {
+      // Load HLS.js
+      if (!window.Hls) {
+        const hlsScript = document.createElement('script');
+        hlsScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.7/hls.min.js';
+        hlsScript.async = true;
+        document.head.appendChild(hlsScript);
+        await new Promise(resolve => hlsScript.onload = resolve);
+      }
+    };
+
+    loadScripts();
+  }, []);
+
+  // Auto-unlock audio on first user gesture (mousemove / touchstart / click / keydown)
+  useEffect(() => {
+    const unlockAudio = () => {
+      const v = videoRef.current;
+      if (!v) return;
+      if (v.muted) {
+        try {
+          v.muted = false;
+        } catch {}
+        setIsMuted(false);
+      }
+      // clean up listeners (they were added with { once: true } but remove just in case)
+      window.removeEventListener('mousemove', unlockAudio);
+      window.removeEventListener('touchstart', unlockAudio);
+      window.removeEventListener('click', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
+
+    // Listen once for each allowed gesture (passive where appropriate)
+    window.addEventListener('mousemove', unlockAudio, { once: true, passive: true } as any);
+    window.addEventListener('touchstart', unlockAudio, { once: true, passive: true } as any);
+    window.addEventListener('click', unlockAudio, { once: true, passive: true } as any);
+    window.addEventListener('keydown', unlockAudio, { once: true, passive: true } as any);
+
+    return () => {
+      window.removeEventListener('mousemove', unlockAudio);
+      window.removeEventListener('touchstart', unlockAudio);
+      window.removeEventListener('click', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
+  }, []);
+
+  // NEW: detect device type (very lightweight heuristic)
+  useEffect(() => {
+    const ua = navigator.userAgent || '';
+    const isTV = /(SMART-TV|SmartTV|HbbTV|NetCast|Tizen|Roku|BRAVIA|Android TV|AppleTV|CrKey|GoogleTV)/i.test(ua) || (navigator.userAgentData && (navigator.userAgentData.platform || '').toLowerCase().includes('tv'));
+    const isAndroid = /Android/i.test(ua);
+    const isTablet = /iPad|Tablet|PlayBook|Silk|Kindle|SM-T|GT-P/i.test(ua) || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1 && window.innerWidth >= 768 && window.innerWidth <= 1024);
+    const isMobile = /Mobi|iPhone|Android.*Mobile|Windows Phone/i.test(ua) && !isTablet;
+
+    if (isTV) setDeviceType('tv');
+    else if (isTablet) setDeviceType('tablet');
+    else if (isMobile) setDeviceType('phone');
+    else setDeviceType('desktop');
+
+    // Also update on resize/orientation change to react to e.g. connecting to TV or rotating phone
+    const onResize = () => {
+      const width = window.innerWidth;
+      if (width >= 1920) setDeviceType(d => d === 'tv' ? 'tv' : 'desktop');
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  // Cleanup function
+  const cleanup = useCallback(() => {
+    // stop watchdog
+    if (watchdogIntervalRef.current) {
+      clearInterval(watchdogIntervalRef.current);
+      watchdogIntervalRef.current = null;
+    }
+
+    if (shakaPlayerRef.current) {
+      try { shakaPlayerRef.current.destroy(); } catch(e){ console.warn('shaka destroy', e); }
+      shakaPlayerRef.current = null;
+    }
+    if (hlsRef.current) {
+      try { hlsRef.current.destroy(); } catch(e){ console.warn('hls destroy', e); }
+      hlsRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.src = '';
+      try { videoRef.current.load(); } catch(e) { /* ignore */ }
+    }
+    setError(null);
+    setAvailableQualities(['auto']);
+  }, []);
+
+  // Reset ad flag when channel changes
+  useEffect(() => {
+    adPlayedRef.current = false;
+  }, [channel?.stream_url]);
+
+  // Load channel (with ad support)
+  useEffect(() => {
+    if (!channel || !videoRef.current) {
+      cleanup();
+      return;
+    }
+
+    const loadChannel = async () => {
+      setIsLoading(true);
+      setError(null);
+      cleanup();
+
+      const video = videoRef.current!;
+
+      // Ensure autoplay starts muted and React state reflects that
+      try {
+        video.muted = false;
+      } catch {}
+      setIsMuted(false);
+
+      try {
+        // first: attempt to play ad if present and not yet played
+        if (channel.ad_url && !adPlayedRef.current) {
+          adPlayedRef.current = true;
+          await playAd(video, channel.ad_url);
+        }
+
+        // then load main stream
+        await loadMainStream(video, channel);
+        setIsPlaying(true);
+      } catch (err: any) {
+        console.error('Error loading channel:', err);
+        setError(err.message || 'Failed to load channel');
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    loadChannel();
+
+    return cleanup;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channel]);
+
+  // Play the ad (supports MP4 or M3U8 proxied URLs)
+  const playAd = async (video: HTMLVideoElement, adUrl: string) => {
     try {
-      const ua = navigator.userAgent || (navigator as any).vendor || (window as any).opera || '';
-      const width = window.innerWidth || screen.width || 1024;
+      setIsAdPlaying(true);
+      setShowControls(true);
+      setIsLoading(true);
 
-      // TV heuristics
-      if (/SMART-TV|SmartTV|TV|HbbTV|NetCast|AppleTV|CrKey|Roku|BRAVIA|SMART-TV/i.test(ua)) return 'tv';
-      // Android-specific
-      if (/Android/i.test(ua)) return width <= 768 ? 'android-phone' : 'android-tablet';
-      // iPad/tablet
-      if (/iPad|Tablet|PlayBook/i.test(ua)) return 'tablet';
-      // Touch-capable narrow screens -> mobile
-      if ('maxTouchPoints' in navigator && (navigator as any).maxTouchPoints > 1 && width <= 900) return 'mobile';
-      // fallback by width
-      if (width <= 768) return 'mobile';
-      if (width <= 1100) return 'tablet';
-      return 'desktop';
+      const resolved = resolveProxyIfNeeded(adUrl);
+
+      // detect ad type quickly
+      const type = await detectType(resolved);
+
+      return new Promise<void>(async (resolve, reject) => {
+        const cleanupHandlers = () => {
+          video.onended = null;
+          video.onerror = null;
+        };
+
+        video.onended = () => {
+          cleanupHandlers();
+          setIsAdPlaying(false);
+          resolve();
+        };
+
+        video.onerror = (e) => {
+          console.warn('Ad playback error, skipping ad', e);
+          cleanupHandlers();
+          setIsAdPlaying(false);
+          resolve(); // resolve so we continue to main stream
+        };
+
+        try {
+          if (type === 'hls') {
+            // use HLS.js for ad manifest
+            if (window.Hls && window.Hls.isSupported()) {
+              const hls = new window.Hls();
+              hlsRef.current = hls;
+              hls.loadSource(resolved);
+              hls.attachMedia(video);
+              hls.on(window.Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+              hls.on(window.Hls.Events.ERROR, (_: any, data: any) => {
+                console.warn('HLS ad error:', data);
+              });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+              video.src = resolved;
+              await video.play().catch(() => {});
+            } else {
+              console.warn('HLS not supported for ad');
+              resolve();
+            }
+          } else {
+            // direct mp4 or other video
+            video.src = resolved;
+            await video.play().catch(() => {});
+          }
+        } catch (e) {
+          console.warn('Ad play exception:', e);
+          cleanupHandlers();
+          setIsAdPlaying(false);
+          resolve();
+        } finally {
+          setIsLoading(false);
+        }
+      });
+    } finally {
+      setIsAdPlaying(false);
+      setIsLoading(false);
+    }
+  };
+
+  // Resolve proxy only if needed (prevents double-wrapping)
+  const resolveProxyIfNeeded = (url: string) => {
+    try {
+      // If already points to our proxy, return as-is
+      if (url.includes('poohlover.serv00.net')) return url;
+
+      const isHttpsPage = location.protocol === 'https:';
+      // If page is HTTPS and url is HTTP (mixed content), proxy it
+      if (isHttpsPage && url.startsWith('http://')) {
+        return PROXY_BASE + encodeURIComponent(url);
+      }
+
+      // If the origin differs and you still want to route through proxy for CORS, uncomment next line
+      // return PROXY_BASE + encodeURIComponent(url);
+
+      return url;
     } catch (e) {
-      return 'desktop';
+      return url;
     }
-  }, []);
+  };
 
-  // Keep device type current on resize / orientation change
-  useEffect(() => {
-    const setType = () => setDeviceType(detectDeviceType());
-    setType();
+  // detect stream type: 'hls' | 'dash' | 'video' | 'unknown'
+  const detectType = async (url: string) : Promise<'hls'|'dash'|'video'|'unknown'> => {
+    try {
+      // Quick pattern checks
+      const lower = url.toLowerCase();
+      if (lower.includes('.m3u8') || lower.includes('playlist.m3u8') || lower.includes('master.m3u8') || lower.includes('index.m3u8')) return 'hls';
+      if (lower.endsWith('.mpd')) return 'dash';
+      if (lower.match(/\.(mp4|webm|ogg|mkv|ts)(\?|$)/)) return 'video';
 
-    // Use ResizeObserver to detect parent/container size changes and adapt layout
-    const ro = new ResizeObserver(() => setType());
-    if (document.body) ro.observe(document.body);
+      // Try HEAD, but many servers/proxies block it
+      try {
+        const head = await fetch(url, { method: 'HEAD' });
+        const ct = head.headers.get('content-type') || '';
+        if (ct.includes('application/vnd.apple.mpegurl') || ct.includes('application/x-mpegurl')) return 'hls';
+        if (ct.includes('application/dash+xml')) return 'dash';
+        if (ct.startsWith('video/')) return 'video';
+      } catch (e) {
+        // ignore
+      }
 
-    window.addEventListener('orientationchange', setType);
-    window.addEventListener('resize', setType);
+      // Fall back to small range GET and inspect text
+      try {
+        const r = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-2048' } });
+        const text = await r.text();
+        if (text.startsWith('#EXTM3U')) return 'hls';
+        if (text.includes('<MPD')) return 'dash';
+        if (text.length > 0 && /\<\!DOCTYPE html\>|<html/i.test(text)) return 'unknown';
+      } catch (e) {
+        // ignore
+      }
 
-    return () => {
-      ro.disconnect();
-      window.removeEventListener('orientationchange', setType);
-      window.removeEventListener('resize', setType);
-    };
-  }, [detectDeviceType]);
+      return 'unknown';
+    } catch (e) {
+      return 'unknown';
+    }
+  };
 
-  // Adjust video object-fit depending on device type for best UX on TVs/phones
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    if (deviceType === 'tv' || deviceType === 'desktop') {
-      v.style.objectFit = 'cover';
+  // Load the main stream (MP4 / HLS / DASH / direct)
+  const loadMainStream = async (video: HTMLVideoElement, ch: Channel) => {
+    const resolved = resolveProxyIfNeeded(ch.stream_url);
+
+    // embed platforms
+    if (resolved.includes('youtube.com') || resolved.includes('youtu.be') || resolved.includes('twitch.tv')) {
+      // handing back to parent render (will render iframe)
+      return;
+    }
+
+    const type = await detectType(resolved);
+
+    if (type === 'dash' || ch.stream_type === 'mpd') {
+      await loadMPD(video, { ...ch, stream_url: resolved });
+    } else if (type === 'hls' || ch.stream_type === 'm3u8') {
+      await loadHLS(video, { ...ch, stream_url: resolved });
+    } else if (type === 'video' || ch.stream_type === 'mp4' || ch.stream_type === 'direct') {
+      await playDirect(video, resolved);
     } else {
-      v.style.objectFit = 'contain';
+      // fallback: try HLS, then direct
+      try {
+        await loadHLS(video, { ...ch, stream_url: resolved });
+      } catch {
+        await playDirect(video, resolved);
+      }
     }
-  }, [deviceType]);
+  };
 
-  // Controls hide/show logic tuned per device; shorter delay for touch devices
-  const getControlsHideDelay = useCallback(() => {
-    if (deviceType === 'tv') return 7000; // keep controls visible longer for remote navigation
-    if (deviceType === 'mobile' || deviceType === 'android-phone' || deviceType === 'android-tablet') return 2500;
-    return 3000; // desktop/tablet with mouse
-  }, [deviceType]);
+  // Play direct video
+  const playDirect = async (video: HTMLVideoElement, url: string) => {
+    // Optimize: allow immediate preload and muted autoplay attempt to reduce delay
+    video.preload = 'auto';
+    try { video.muted = false; } catch {}
+    setIsMuted(false);
+    video.src = url;
+    await video.play().catch(e => console.warn('Direct play error', e));
+    // restore muted state to UI preference if needed (we keep autoplay-muted; unmute unlocked via gesture)
+    // Do not programmatically unmute here — browsers will block it if no gesture
+  };
 
-  const showControlsTemporarily = useCallback(() => {
-    setShowControls(true);
-    if (controlsTimeoutRef.current) {
-      window.clearTimeout(controlsTimeoutRef.current);
+  // Load HLS: tuned for low latency + robust error recovery
+  const loadHLS = async (video: HTMLVideoElement, ch: Channel) => {
+    // If native HLS is supported (Safari), prefer native (it's often the lowest-latency)
+    if (!window.Hls) {
+      if (video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = ch.stream_url;
+        video.preload = 'auto';
+        try { video.muted = false; } catch {}
+        setIsMuted(false);
+        await video.play().catch(()=>{});
+        return;
+      }
+      throw new Error('HLS not supported');
     }
-    controlsTimeoutRef.current = window.setTimeout(() => {
-      // only auto-hide when playing and not interacting
-      setShowControls(prev => (isPlaying ? false : prev));
-    }, getControlsHideDelay());
-  }, [getControlsHideDelay, isPlaying]);
 
-  // Pointer/touch listeners for smooth auto-hide
+    // Cleanup previous
+    if (hlsRef.current) {
+      try { hlsRef.current.destroy(); } catch (e) { console.warn('hls destroy', e); }
+      hlsRef.current = null;
+    }
+
+    // HLS.js configuration tuned for fast start and low-latency live
+    const hlsConfig = {
+      enableWorker: true,
+      maxBufferLength: 25,            // keep buffer reasonably low to reduce latency
+      maxMaxBufferLength: 45,
+      maxBufferSize: 60 * 1000 * 1000,
+      maxBufferHole: 0.5,
+      lowLatencyMode: true,           // enable LL-HLS support when available
+      liveSyncDuration: 3,            // target distance from live (seconds)
+      liveMaxLatencyDuration: 12,     // upper bound on latency to live edge
+      startLevel: -1,
+      startFragPrefetch: true,
+      capLevelToPlayerSize: true,
+      // nudgeOffset and nudgeMaxRetry are helpful in some network cases
+      nudgeOffset: 0.1,
+      nudgeMaxRetry: 3
+    };
+
+    const hls = new window.Hls(hlsConfig);
+    hlsRef.current = hls;
+
+    // attach and load
+    hls.loadSource(ch.stream_url);
+    hls.attachMedia(video);
+
+    // attempt immediate autoplay via muted trick (improves "no autoplay" on some browsers)
+    video.preload = 'auto';
+    try { video.muted = false; } catch {}
+    setIsMuted(false);
+    try { await video.play().catch(()=>{}); } catch {}
+
+    // HLS event handlers - populate qualities and add robust error recovery
+    hls.on(window.Hls.Events.MANIFEST_PARSED, (_: any, data: any) => {
+      try {
+        const qualities = (data.levels || []).map((l: any) => `${l.height || l.name || 'auto'}p`);
+        setAvailableQualities(Array.from(new Set(['auto', ...qualities])));
+        // start loading from live edge
+        hls.startLoad(-1);
+        // if we can autoplay, try; otherwise UI play will work
+        video.play().catch(()=>{});
+      } finally {
+        setIsLoading(false);
+      }
+    });
+
+    // When fragments buffered, clear loading UI
+    hls.on(window.Hls.Events.FRAG_BUFFERED, () => {
+      setIsLoading(false);
+    });
+
+    // Listen to level updated to reflect resolution changes
+    hls.on(window.Hls.Events.LEVEL_SWITCHED, () => {
+      // nothing here, but could be used to set current quality
+    });
+
+    // Error handling - aggressive recovery for network/media errors
+    hls.on(window.Hls.Events.ERROR, (_: any, data: any) => {
+      console.warn('HLS error event:', data);
+      if (!data || !data.fatal) return;
+
+      try {
+        // Try to auto-recover common fatal error types
+        if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
+          // attempt to restart loading
+          try {
+            hls.startLoad();
+            setTimeout(() => { /* Let the loader settle */ }, 500);
+          } catch (e) {
+            console.warn('hls network recovery failed', e);
+            try { hls.destroy(); } catch {}
+          }
+        } else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+          try {
+            hls.recoverMediaError();
+          } catch (e) {
+            console.warn('hls media recovery error', e);
+            try { hls.destroy(); } catch {}
+          }
+        } else {
+          // fallback: full reload of hls instance
+          try {
+            hls.destroy();
+            // re-create and re-attach one time
+            const newHls = new window.Hls(hlsConfig);
+            hlsRef.current = newHls;
+            newHls.loadSource(ch.stream_url);
+            newHls.attachMedia(video);
+            newHls.startLoad(-1);
+          } catch (e) {
+            console.error('hls full reload failed', e);
+            setError('Stream error occurred');
+          }
+        }
+      } catch (e) {
+        console.error('hls error handling broken', e);
+      }
+    });
+
+    // Keep last-progress for watchdog
+    lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime || 0 };
+
+    // Start a lightweight watchdog to detect stalls (no progress for X seconds)
+    if (watchdogIntervalRef.current) {
+      clearInterval(watchdogIntervalRef.current);
+      watchdogIntervalRef.current = null;
+    }
+    watchdogIntervalRef.current = window.setInterval(() => {
+      try {
+        const now = Date.now();
+        const prev = lastProgressRef.current;
+        if (video.paused || video.seeking || isAdPlaying) {
+          lastProgressRef.current = { time: now, currentTime: video.currentTime };
+          return;
+        }
+        // If no progress in >6s while playing, attempt recovery
+        if (video.currentTime === prev.currentTime && now - prev.time > 6000) {
+          console.warn('Watchdog: detected stall, attempting recovery');
+          // try media error recovery
+          try { hls.recoverMediaError(); } catch(e){ console.warn('recoverMediaError failed', e); }
+          // if still stalled, try restarting load
+          try { hls.stopLoad(); hls.startLoad(-1); } catch(e){ console.warn('hls restart failed', e); }
+          lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime };
+        } else {
+          // progress observed -> update
+          lastProgressRef.current = { time: now, currentTime: video.currentTime };
+        }
+      } catch (e) {
+        // ignore
+      }
+    }, 2500);
+  };
+
+  // Load MPD (DASH) with Shaka
+  const loadMPD = async (video: HTMLVideoElement, ch: Channel) => {
+    if (!window.shaka) throw new Error('Shaka Player not loaded');
+
+    // Cleanup previous
+    if (shakaPlayerRef.current) {
+      try { shakaPlayerRef.current.destroy(); } catch(e) { console.warn('old shaka destroy', e); }
+      shakaPlayerRef.current = null;
+    }
+
+    const player = new window.shaka.Player(video);
+    shakaPlayerRef.current = player;
+
+    // Configure Shaka for low latency + robust behavior
+    player.configure({
+      streaming: {
+        lowLatencyMode: true,      // enable LL-DASH/Low-latency behavior when the manifest supports it
+        bufferingGoal: 10,         // seconds - keep this moderate to reduce latency
+        rebufferingGoal: 1,        // seconds - attempt to rebuffer quickly
+        bufferBehind: 30,
+        smallGapLimit: 0.5,
+        ignoreMinBufferTime: true
+      },
+      abr: {
+        enabled: true,
+        defaultBandwidthEstimate: 5000000, // bias initial selection toward higher BW to avoid slow startup switching
+      },
+      manifest: {
+        retryParameters: {
+          maxAttempts: 5,
+          baseDelay: 1000,
+          backoffFactor: 2
+        }
+      }
+    });
+
+    // Configure ClearKey if provided
+    if ((ch as any).clearkey_kid && (ch as any).clearkey_key) {
+      player.configure({
+        drm: {
+          clearKeys: {
+            [(ch as any).clearkey_kid]: (ch as any).clearkey_key
+          }
+        }
+      });
+    }
+
+    if ((ch as any).license_url) {
+      player.configure({ drm: { servers: { 'com.widevine.alpha': (ch as any).license_url } } });
+    }
+
+    player.addEventListener('error', (event: any) => {
+      console.error('Shaka error:', event.detail);
+      setError('Playback error occurred');
+      // Attempt a soft recovery on network errors
+      try {
+        const severity = event.detail && event.detail.severity;
+        if (severity === window.shaka.util.Error.Severity.RECOVERABLE) {
+          // try to reconfigure ABR to be more conservative
+          player.configure({ abr: { enabled: true, defaultBandwidthEstimate: 1000000 } });
+        } else {
+          // fatal -> try reloading manifest once
+          player.unload().then(() => player.load(ch.stream_url)).catch(e => console.warn('shaka reload failed', e));
+        }
+      } catch(e){}
+    });
+
+    player.addEventListener('adaptation', () => {
+      const tracks = player.getVariantTracks();
+      const qualities = tracks.map((t: any) => `${t.height}p`).filter((v: string, i: number, a: string[]) => a.indexOf(v) === i);
+      setAvailableQualities(['auto', ...qualities]);
+    });
+
+    // Start load
+    try {
+      await player.load(ch.stream_url);
+      video.preload = 'auto';
+      try { video.muted = false; } catch {}
+      setIsMuted(false);
+      await video.play().catch(()=>{});
+    } catch (e) {
+      console.error('Shaka load/play failed', e);
+      setError('Failed to load DASH stream');
+    }
+
+    // Watchdog for Shaka: watch for stalls and try to recover by reducing quality
+    lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime || 0 };
+    if (watchdogIntervalRef.current) {
+      clearInterval(watchdogIntervalRef.current);
+      watchdogIntervalRef.current = null;
+    }
+    watchdogIntervalRef.current = window.setInterval(() => {
+      try {
+        const now = Date.now();
+        const prev = lastProgressRef.current;
+        if (video.paused || video.seeking || isAdPlaying) {
+          lastProgressRef.current = { time: now, currentTime: video.currentTime };
+          return;
+        }
+        if (video.currentTime === prev.currentTime && now - prev.time > 6000) {
+          console.warn('Watchdog (shaka): detected stall, attempting recovery');
+          // Try lowering ABR aggressiveness or selecting lower track
+          try {
+            const tracks = shakaPlayerRef.current.getVariantTracks().filter((t:any) => t.allowed);
+            const sorted = tracks.sort((a:any,b:any)=>a.bandwidth-b.bandwidth);
+            if (sorted.length) {
+              const lowest = sorted[0];
+              shakaPlayerRef.current.configure({ abr: { enabled: false } });
+              shakaPlayerRef.current.selectVariantTrack(lowest, /*clearBuffer=*/ true);
+            } else {
+              // fallback: reload manifest
+              shakaPlayerRef.current.reload();
+            }
+          } catch (e) {
+            console.warn('shaka watchdog recovery failed', e);
+            try { shakaPlayerRef.current.reload(); } catch {}
+          }
+          lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime };
+        } else {
+          lastProgressRef.current = { time: now, currentTime: video.currentTime };
+        }
+      } catch (e) {}
+    }, 2500);
+  };
+
+  // Video event handlers
   useEffect(() => {
-    const onPointerMove = (e: PointerEvent) => {
-      lastPointerTypeRef.current = e.pointerType;
-      showControlsTemporarily();
-    };
-    const onPointerDown = (e: PointerEvent) => {
-      lastPointerTypeRef.current = e.pointerType;
-      showControlsTemporarily();
-    };
-    const onTouchStart = (e: TouchEvent) => {
-      lastPointerTypeRef.current = 'touch';
-      showControlsTemporarily();
-    };
+    const video = videoRef.current;
+    if (!video) return;
 
-    // prefer pointer events where supported
-    window.addEventListener('pointermove', onPointerMove, { passive: true });
-    window.addEventListener('pointerdown', onPointerDown, { passive: true });
-    window.addEventListener('touchstart', onTouchStart, { passive: true });
-
-    return () => {
-      window.removeEventListener('pointermove', onPointerMove as any);
-      window.removeEventListener('pointerdown', onPointerDown as any);
-      window.removeEventListener('touchstart', onTouchStart as any);
-    };
-  }, [showControlsTemporarily]);
-
-  // Fullscreen change handler (keeps state in sync even if F11 or remote toggles)
-  useEffect(() => {
-    const handleFs = () => setIsFullscreen(!!document.fullscreenElement);
-    document.addEventListener('fullscreenchange', handleFs);
-    return () => document.removeEventListener('fullscreenchange', handleFs);
-  }, []);
-
-  // Keep the existing large body of playback logic from your original component.
-  // For brevity in this file, re-implement those functions (HLS, Shaka, ad playback, detectType, loadChannel, cleanup, etc.)
-  // NOTE: Paste/retain your existing implementations here — they will continue to work with the improved responsiveness and input handling above.
-
-  // For demonstration we keep simplified event handlers for the UI controls below.
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    const handleTimeUpdate = () => setCurrentTime(v.currentTime);
-    const handleDurationChange = () => setDuration(v.duration || 0);
+    const handleTimeUpdate = () => setCurrentTime(video.currentTime);
+    const handleDurationChange = () => setDuration(video.duration);
     const handlePlay = () => setIsPlaying(true);
     const handlePause = () => setIsPlaying(false);
     const handleWaiting = () => setIsLoading(true);
     const handlePlaying = () => setIsLoading(false);
 
-    v.addEventListener('timeupdate', handleTimeUpdate);
-    v.addEventListener('durationchange', handleDurationChange);
-    v.addEventListener('play', handlePlay);
-    v.addEventListener('pause', handlePause);
-    v.addEventListener('waiting', handleWaiting);
-    v.addEventListener('playing', handlePlaying);
+    video.addEventListener('timeupdate', handleTimeUpdate);
+    video.addEventListener('durationchange', handleDurationChange);
+    video.addEventListener('play', handlePlay);
+    video.addEventListener('pause', handlePause);
+    video.addEventListener('waiting', handleWaiting);
+    video.addEventListener('playing', handlePlaying);
 
     return () => {
-      v.removeEventListener('timeupdate', handleTimeUpdate);
-      v.removeEventListener('durationchange', handleDurationChange);
-      v.removeEventListener('play', handlePlay);
-      v.removeEventListener('pause', handlePause);
-      v.removeEventListener('waiting', handleWaiting);
-      v.removeEventListener('playing', handlePlaying);
+      video.removeEventListener('timeupdate', handleTimeUpdate);
+      video.removeEventListener('durationchange', handleDurationChange);
+      video.removeEventListener('play', handlePlay);
+      video.removeEventListener('pause', handlePause);
+      video.removeEventListener('waiting', handleWaiting);
+      video.removeEventListener('playing', handlePlaying);
     };
   }, []);
 
-  // UI actions (play/pause, mute/unmute etc.)
+  // Controls visibility
+  const showControlsTemporarily = useCallback(() => {
+    setShowControls(true);
+    if (controlsTimeoutRef.current) {
+      clearTimeout(controlsTimeoutRef.current);
+    }
+    controlsTimeoutRef.current = setTimeout(() => {
+      if (isPlaying) setShowControls(false);
+    }, 3000);
+  }, [isPlaying]);
+
+  // NEW: attach pointer/touch listeners for mobile smooth show/hide
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const onTouch = (e: Event) => {
+      // touch is a gesture that should reveal controls briefly
+      showControlsTemporarily();
+    };
+
+    el.addEventListener('touchstart', onTouch, { passive: true });
+    el.addEventListener('pointermove', showControlsTemporarily as any, { passive: true });
+
+    return () => {
+      el.removeEventListener('touchstart', onTouch as any);
+      el.removeEventListener('pointermove', showControlsTemporarily as any);
+    };
+  }, [showControlsTemporarily]);
+
+  // Fullscreen handling
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  }, []);
+
   const togglePlay = () => {
-    if (!videoRef.current) return;
-    if (isPlaying) videoRef.current.pause();
-    else videoRef.current.play().catch(() => {});
+    if (videoRef.current) {
+      if (isPlaying) {
+        videoRef.current.pause();
+      } else {
+        // Some browsers block autoplay if not muted; attempt play and swallow errors
+        if (videoRef.current.paused) {
+          // If user explicitly clicks play, treat it as a gesture — allow unmuting if desired
+          try {
+            // Only unmute on explicit click if we want that behavior; keep commented if you prefer only mousemove/touch
+            // if (videoRef.current.muted) { videoRef.current.muted = false; setIsMuted(false); }
+          } catch {}
+
+          videoRef.current.play().catch(()=>{});
+        }
+      }
+    }
   };
 
   const toggleMute = () => {
-    if (!videoRef.current) return;
-    const next = !isMuted;
-    try { videoRef.current.muted = next; } catch {}
-    setIsMuted(next);
+    if (videoRef.current) {
+      videoRef.current.muted = !isMuted;
+      setIsMuted(!isMuted);
+    }
   };
 
   const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -297,9 +827,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   };
 
   const toggleFullscreen = () => {
-    if (!containerRef.current) return;
-    if (!document.fullscreenElement) containerRef.current.requestFullscreen().catch(() => {});
-    else document.exitFullscreen().catch(() => {});
+    if (containerRef.current) {
+      if (!document.fullscreenElement) {
+        containerRef.current.requestFullscreen();
+      } else {
+        document.exitFullscreen();
+      }
+    }
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -317,11 +851,47 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Render YouTube specially (same as your original)
+  const handleQualityChange = (q: string) => {
+    setQuality(q);
+    setShowSettings(false);
+
+    if (hlsRef.current) {
+      if (q === 'auto') {
+        hlsRef.current.currentLevel = -1;
+        hlsRef.current.loadLevel = -1;
+      } else {
+        const level = hlsRef.current.levels.findIndex((l: any) => `${l.height}p` === q);
+        if (level !== -1) hlsRef.current.currentLevel = level;
+      }
+    }
+
+    if (shakaPlayerRef.current) {
+      const tracks = shakaPlayerRef.current.getVariantTracks();
+      if (q === 'auto') {
+        shakaPlayerRef.current.configure({ abr: { enabled: true } });
+      } else {
+        const track = tracks.find((t: any) => `${t.height}p` === q);
+        if (track) {
+          shakaPlayerRef.current.configure({ abr: { enabled: false } });
+          shakaPlayerRef.current.selectVariantTrack(track, true);
+        }
+      }
+    }
+  };
+
+  // YouTube embed handling
   if (channel?.stream_type === 'youtube') {
     const videoId = channel.stream_url.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/)?.[1];
+    
     return (
-      <div ref={containerRef} className="relative w-full max-w-[1400px] mx-auto aspect-video bg-black rounded-lg overflow-hidden" style={{ border: '4px solid #5d4037' }}>
+      <div 
+        ref={containerRef}
+        className="relative w-full aspect-video bg-black rounded-lg overflow-hidden"
+        style={{ 
+          boxShadow: '0 0 30px rgba(0,0,0,0.8), inset 0 0 60px rgba(139, 69, 19, 0.3)',
+          border: '4px solid #5d4037'
+        }}
+      >
         <iframe
           src={`https://www.youtube.com/embed/${videoId}?autoplay=1&rel=0`}
           className="w-full h-full"
@@ -332,31 +902,51 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     );
   }
 
-  // Main player UI
+  // Compute responsive container style (only modifying the container/video presentation)
+  const baseContainerStyle: React.CSSProperties = {
+    boxShadow: '0 0 30px rgba(0,0,0,0.8), inset 0 0 60px rgba(139, 69, 19, 0.3)',
+    border: '4px solid #5d4037',
+    backgroundImage: 'linear-gradient(45deg, #3e2723 25%, transparent 25%), linear-gradient(-45deg, #3e2723 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #3e2723 75%), linear-gradient(-45deg, transparent 75%, #3e2723 75%)',
+    backgroundSize: '20px 20px',
+    backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px'
+  };
+
+  // Responsive adjustments based on detected device type
+  const containerResponsiveStyle: React.CSSProperties = (() => {
+    switch (deviceType) {
+      case 'tv':
+        // For TVs prefer to fill the screen if possible
+        return { width: '100vw', height: '100vh', maxWidth: '100%', maxHeight: '100vh' };
+      case 'phone':
+        // For phones, take full width and keep a comfortable max height
+        return { width: '100%', maxWidth: '100%', height: 'auto' };
+      case 'tablet':
+        return { width: '100%', maxWidth: '100%', height: 'auto' };
+      case 'desktop':
+      default:
+        return { width: '100%', maxWidth: '1200px', margin: '0 auto', height: 'auto' };
+    }
+  })();
+
+  // video objectFit based on device: TV -> cover (fullscreen), others -> contain
+  const videoObjectFit = deviceType === 'tv' ? 'cover' : 'contain';
+
   return (
     <div 
       ref={containerRef}
-      className={`relative w-full max-w-[1400px] mx-auto ${deviceType === 'tv' ? 'min-h-[56vh]' : ''} rounded-lg overflow-hidden group`}
+      className="relative w-full aspect-video bg-black rounded-lg overflow-hidden group"
       onMouseMove={showControlsTemporarily}
       onMouseLeave={() => isPlaying && setShowControls(false)}
       onTouchStart={showControlsTemporarily}
-      style={{ 
-        boxShadow: '0 0 30px rgba(0,0,0,0.8), inset 0 0 60px rgba(139, 69, 19, 0.3)',
-        border: '4px solid #5d4037',
-        backgroundImage: 'linear-gradient(45deg, #3e2723 25%, transparent 25%), linear-gradient(-45deg, #3e2723 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #3e2723 75%), linear-gradient(-45deg, transparent 75%, #3e2723 75%)',
-        backgroundSize: '20px 20px',
-        backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px'
-      }}
+      style={{ ...baseContainerStyle, ...containerResponsiveStyle }}
     >
-      {/* Responsive Video Element */}
+      {/* Video Element */}
       <video
         ref={videoRef}
-        className={`w-full h-full ${deviceType === 'tv' ? 'object-cover' : 'object-contain'}`}
+        className="w-full h-full"
+        style={{ objectFit: videoObjectFit }}
         playsInline
         onClick={togglePlay}
-        // Accessibility
-        role="video"
-        aria-label={channel?.name || 'Video player'}
       />
 
       {/* Ad badge */}
@@ -380,11 +970,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
         </div>
       )}
 
-      {/* Wooden Frame Corners (decorative) */}
-      <div className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-amber-800 rounded-tl-lg" aria-hidden />
-      <div className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-amber-800 rounded-tr-lg" aria-hidden />
-      <div className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-amber-800 rounded-bl-lg" aria-hidden />
-      <div className="absolute bottom-0 right-0 w-8 h-8 border-b-4 border-r-4 border-amber-800 rounded-br-lg" aria-hidden />
+      {/* Wooden Frame Corners */}
+      <div className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-amber-800 rounded-tl-lg" />
+      <div className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-amber-800 rounded-tr-lg" />
+      <div className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-amber-800 rounded-bl-lg" />
+      <div className="absolute bottom-0 right-0 w-8 h-8 border-b-4 border-r-4 border-amber-800 rounded-br-lg" />
 
       {/* Controls Overlay */}
       {channel && (
@@ -406,7 +996,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
                 onChange={handleSeek}
                 className="w-full h-1 appearance-none cursor-pointer rounded-full"
                 style={{
-                  background: `linear-gradient(to right, #fbbf24 0%, #fbbf24 ${(currentTime / Math.max(duration, 1)) * 100}%, #5d4037 ${(currentTime / Math.max(duration, 1)) * 100}%, #5d4037 100%)`
+                  background: `linear-gradient(to right, #fbbf24 0%, #fbbf24 ${(currentTime / duration) * 100}%, #5d4037 ${(currentTime / duration) * 100}%, #5d4037 100%)`
                 }}
               />
             </div>
@@ -487,7 +1077,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
                     {availableQualities.map((q) => (
                       <button
                         key={q}
-                        onClick={() => { setQuality(q); setShowSettings(false); }}
+                        onClick={() => handleQualityChange(q)}
                         className={`w-full px-3 py-2 text-left text-sm transition-colors ${
                           quality === q ? 'bg-amber-600 text-white' : 'text-amber-200 hover:bg-amber-800'
                         }`}
