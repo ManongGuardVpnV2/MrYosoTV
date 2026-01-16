@@ -1,6 +1,5 @@
-
 import React, { useEffect, useRef, useState, useCallback } from 'react'; 
-import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, SkipBack, SkipForward } from 'lucide-react';
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, SkipBack, SkipForward, Power } from 'lucide-react';
 import { Channel } from '@/types';
 
 interface VideoPlayerProps {
@@ -115,6 +114,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const [availableQualities, setAvailableQualities] = useState<string[]>(['auto']);
   const [isAdPlaying, setIsAdPlaying] = useState(false);
 
+  // NEW: Stream enabled (On/Off)
+  const [isStreamEnabled, setIsStreamEnabled] = useState(true);
+
   const controlsTimeoutRef = useRef<NodeJS.Timeout>();
   const adPlayedRef = useRef(false);
 
@@ -202,16 +204,25 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     }
     setError(null);
     setAvailableQualities(['auto']);
+    setIsPlaying(false);
+    setIsAdPlaying(false);
   }, []);
 
   // Reset ad flag when channel changes
   useEffect(() => {
     adPlayedRef.current = false;
+    // If a new channel arrives, re-enable stream by default
+    setIsStreamEnabled(true);
   }, [channel?.stream_url]);
 
-  // Load channel (with ad support)
+  // Load channel (with ad support) - respects isStreamEnabled
   useEffect(() => {
     if (!channel || !videoRef.current) {
+      cleanup();
+      return;
+    }
+
+    if (!isStreamEnabled) {
       cleanup();
       return;
     }
@@ -251,7 +262,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
     return cleanup;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [channel]);
+  }, [channel, isStreamEnabled]);
 
   // Play the ad (supports MP4 or M3U8 proxied URLs)
   const playAd = async (video: HTMLVideoElement, adUrl: string) => {
@@ -335,9 +346,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
         return PROXY_BASE + encodeURIComponent(url);
       }
 
-      // If the origin differs and you still want to route through proxy for CORS, uncomment next line
-      // return PROXY_BASE + encodeURIComponent(url);
-
       return url;
     } catch (e) {
       return url;
@@ -370,7 +378,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
         const text = await r.text();
         if (text.startsWith('#EXTM3U')) return 'hls';
         if (text.includes('<MPD')) return 'dash';
-        if (text.length > 0 && /\<\!DOCTYPE html\>|<html/i.test(text)) return 'unknown';
+        if (text.length > 0 && /\<!DOCTYPE html\>|<html/i.test(text)) return 'unknown';
       } catch (e) {
         // ignore
       }
@@ -777,12 +785,6 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
       } else {
         // Some browsers block autoplay if not muted; attempt play and swallow errors
         if (videoRef.current.paused) {
-          // If user explicitly clicks play, treat it as a gesture — allow unmuting if desired
-          try {
-            // Only unmute on explicit click if we want that behavior; keep commented if you prefer only mousemove/touch
-            // if (videoRef.current.muted) { videoRef.current.muted = false; setIsMuted(false); }
-          } catch {}
-
           videoRef.current.play().catch(()=>{});
         }
       }
@@ -855,6 +857,21 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
           shakaPlayerRef.current.selectVariantTrack(track, true);
         }
       }
+    }
+  };
+
+  // Stream On/Off toggle handler
+  const toggleStreamEnabled = () => {
+    if (isStreamEnabled) {
+      // turn off: immediately cleanup and keep overlay visible
+      cleanup();
+      setIsStreamEnabled(false);
+      setShowControls(true);
+    } else {
+      // turn on: enable and allow useEffect to load channel
+      setIsStreamEnabled(true);
+      // keep controls visible so user sees loading
+      setShowControls(true);
     }
   };
 
@@ -1015,6 +1032,19 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
             </div>
 
             <div className="flex items-center gap-2">
+              {/* NEW: On Stream indicator (left of settings) */}
+              <div className="flex items-center gap-2 mr-1">
+                <button
+                  onClick={toggleStreamEnabled}
+                  className={`flex items-center gap-2 px-2 py-1 rounded-md text-sm font-medium transition-all ${isStreamEnabled ? 'bg-emerald-700/80 text-emerald-100' : 'bg-red-800/80 text-red-200'}`}
+                  aria-pressed={isStreamEnabled}
+                  title={isStreamEnabled ? 'Turn stream off' : 'Turn stream on'}
+                >
+                  <span className={`w-2 h-2 rounded-full ${isStreamEnabled ? 'bg-emerald-400' : 'bg-red-400'} block`} />
+                  <span className="hidden md:inline">{isStreamEnabled ? 'On Stream' : 'Off'}</span>
+                </button>
+              </div>
+
               {/* Quality Settings */}
               <div className="relative">
                 <button
@@ -1024,7 +1054,7 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
                   <Settings className="w-5 h-5" />
                 </button>
                 {showSettings && (
-                  <div className="absolute bottom-full right-0 mb-2 bg-amber-900/95 rounded-lg shadow-xl border border-amber-700 overflow-hidden min-w-[120px]">
+                  <div className="absolute bottom-full right-0 mb-2 bg-amber-900/95 rounded-lg shadow-xl border border-amber-700 overflow-hidden min-w-[120px] sm:min-w-[160px]">
                     <div className="px-3 py-2 border-b border-amber-700 text-amber-200 text-xs font-medium">
                       Quality
                     </div>
@@ -1049,6 +1079,15 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
                 className="p-2 text-amber-200 hover:text-amber-400 transition-colors"
               >
                 {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
+              </button>
+
+              {/* Power (explicit shutdown) - visible on md+ to avoid crowding mobile */}
+              <button
+                onClick={() => { toggleStreamEnabled(); /* keep same handler but a clearer affordance */ }}
+                className="hidden md:inline-flex items-center p-2 ml-1 text-amber-200 hover:text-amber-400 transition-colors"
+                title={isStreamEnabled ? 'Shutdown stream' : 'Start stream'}
+              >
+                <Power className="w-5 h-5" />
               </button>
             </div>
           </div>
