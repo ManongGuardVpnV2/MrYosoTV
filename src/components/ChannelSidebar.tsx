@@ -254,7 +254,7 @@ const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
             <p className="text-amber-600 text-xs">
               {sortedChannels.length} channels in {selectedCategory}
             </p>
-            <p className="text-amber-500 text-[10px] mt-1">{isAndroid ? 'Optimized for Android touch' : 'Desktop / Mobile optimized'}</p>
+            
           </div>
         </div>
       </div>
