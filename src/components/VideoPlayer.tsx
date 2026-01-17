@@ -417,49 +417,66 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     }
   };
 
-  // Play direct video with robust fallback (muted autoplay, then blob fallback for CORS issues)
-  const playDirect = async (video: HTMLVideoElement, url: string) => {
-    setIsLoading(true);
-    video.preload = 'auto';
-    video.playsInline = true;
+  // Play direct video with robust fallback (autoplay-safe + blob fallback)
+const playDirect = async (video: HTMLVideoElement, url: string) => {
+  setIsLoading(true);
 
-    // Start muted so autoplay is allowed; user gesture will unmute (see unlockAudio effect)
-    try { video.muted = true; } catch {}
-    setIsMuted(true);
+  // Basic setup
+  video.preload = 'auto';
+  video.playsInline = true;
 
-    // Help with possible CORS issues: prefer crossOrigin for media fetching
-    try { video.crossOrigin = 'anonymous'; } catch(e){}
+  // Autoplay policy: MUST start muted
+  try {
+    video.muted = true;
+  } catch {}
+  setIsMuted(true);
 
-    // Try simple src assignment + play first (fast path)
-    try {
-      video.src = url;
-      video.load();
-      await video.play();
-      setIsLoading(false);
-      return;
-    } catch (e) {
-      console.warn('Direct play failed, trying blob fallback', e);
+  // Helps with some CDNs / range requests
+  try {
+    video.crossOrigin = 'anonymous';
+  } catch {}
+
+  // ---- FAST PATH: normal src playback ----
+  try {
+    video.src = url;
+    video.load();
+    await video.play();
+    setIsLoading(false);
+    return;
+  } catch (err) {
+    console.warn('[direct] src play failed, trying blob fallback', err);
+  }
+
+  // ---- FALLBACK: blob-based playback ----
+  try {
+    const resp = await fetch(url, {
+      mode: 'cors',
+      credentials: 'omit',
+    });
+
+    if (!resp.ok) {
+      throw new Error(`Fetch failed: ${resp.status}`);
     }
 
-    // Blob fallback: fetch the resource and play via object URL. This sometimes bypasses servers that block direct media element fetches.
-    try {
-      const resp = await fetch(url, { mode: 'cors' });
-      if (!resp.ok) throw new Error(`Fetch failed: ${resp.status}`);
-      const blob = await resp.blob();
-      const objUrl = URL.createObjectURL(blob);
-      // store object URL on element so cleanup can revoke it
-      try { (video as any).__objectURL = objUrl; } catch(e){}
-      video.src = objUrl;
-      video.load();
-      await video.play();
-      setIsLoading(false);
-      return;
-    } catch (e) {
-      console.error('Blob fallback failed:', e);
-      setError('Direct stream failed — possible CORS or network issue');
-      setIsLoading(false);
-    }
-  };
+    const blob = await resp.blob();
+    const objectUrl = URL.createObjectURL(blob);
+
+    // Store so cleanup() can revoke it
+    (video as any).__objectURL = objectUrl;
+
+    video.src = objectUrl;
+    video.load();
+    await video.play();
+
+    setIsLoading(false);
+    return;
+  } catch (err) {
+    console.error('[direct] blob fallback failed', err);
+    setError('Direct stream failed (CORS / network issue)');
+    setIsLoading(false);
+  }
+};
+
 
   // Load HLS: tuned for low latency + robust error recovery
   const loadHLS = async (video: HTMLVideoElement, ch: Channel) => {
