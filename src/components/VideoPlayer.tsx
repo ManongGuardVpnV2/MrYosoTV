@@ -1,4 +1,3 @@
-
 import React, { useEffect, useRef, useState, useCallback } from 'react'; 
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, SkipBack, SkipForward } from 'lucide-react';
 import { Channel } from '@/types';
@@ -102,7 +101,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const hlsRef = useRef<any>(null);
   
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isMuted, setIsMuted] = useState(false); // start true to match autoplay-muted behavior
+  const [isMuted, setIsMuted] = useState(true); // start muted to improve autoplay reliability
   const [volume, setVolume] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -152,12 +151,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     const unlockAudio = () => {
       const v = videoRef.current;
       if (!v) return;
-      if (v.muted) {
-        try {
+      // Only unmute if the player was muted for autoplay reasons and user interacted
+      try {
+        if (v.muted) {
           v.muted = false;
-        } catch {}
-        setIsMuted(false);
-      }
+          setIsMuted(false);
+        }
+      } catch {}
       // clean up listeners (they were added with { once: true } but remove just in case)
       window.removeEventListener('mousemove', unlockAudio);
       window.removeEventListener('touchstart', unlockAudio);
@@ -197,6 +197,14 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     }
     if (videoRef.current) {
       videoRef.current.pause();
+      // Revoke any object URL we created (stored on dataset)
+      try {
+        const obj = (videoRef.current as any).__objectURL;
+        if (obj) {
+          URL.revokeObjectURL(obj);
+          delete (videoRef.current as any).__objectURL;
+        }
+      } catch(e){}
       videoRef.current.src = '';
       try { videoRef.current.load(); } catch(e) { /* ignore */ }
     }
@@ -223,11 +231,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
       const video = videoRef.current!;
 
-      // Ensure autoplay starts muted and React state reflects that
+      // Ensure autoplay starts MUTED to comply with browser policies
       try {
-        video.muted = false;
+        video.muted = true;
       } catch {}
-      setIsMuted(false);
+      setIsMuted(true);
 
       try {
         // first: attempt to play ad if present and not yet played
@@ -305,6 +313,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
             }
           } else {
             // direct mp4 or other video
+            // Keep ad muted so autoplay is allowed; user gesture will unmute
+            video.muted = true;
+            video.crossOrigin = 'anonymous';
             video.src = resolved;
             await video.play().catch(() => {});
           }
@@ -334,9 +345,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       if (isHttpsPage && url.startsWith('http://')) {
         return PROXY_BASE + encodeURIComponent(url);
       }
-
-      // If the origin differs and you still want to route through proxy for CORS, uncomment next line
-      // return PROXY_BASE + encodeURIComponent(url);
 
       return url;
     } catch (e) {
@@ -409,16 +417,48 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     }
   };
 
-  // Play direct video
+  // Play direct video with robust fallback (muted autoplay, then blob fallback for CORS issues)
   const playDirect = async (video: HTMLVideoElement, url: string) => {
-    // Optimize: allow immediate preload and muted autoplay attempt to reduce delay
+    setIsLoading(true);
     video.preload = 'auto';
-    try { video.muted = false; } catch {}
-    setIsMuted(false);
-    video.src = url;
-    await video.play().catch(e => console.warn('Direct play error', e));
-    // restore muted state to UI preference if needed (we keep autoplay-muted; unmute unlocked via gesture)
-    // Do not programmatically unmute here — browsers will block it if no gesture
+    video.playsInline = true;
+
+    // Start muted so autoplay is allowed; user gesture will unmute (see unlockAudio effect)
+    try { video.muted = true; } catch {}
+    setIsMuted(true);
+
+    // Help with possible CORS issues: prefer crossOrigin for media fetching
+    try { video.crossOrigin = 'anonymous'; } catch(e){}
+
+    // Try simple src assignment + play first (fast path)
+    try {
+      video.src = url;
+      video.load();
+      await video.play();
+      setIsLoading(false);
+      return;
+    } catch (e) {
+      console.warn('Direct play failed, trying blob fallback', e);
+    }
+
+    // Blob fallback: fetch the resource and play via object URL. This sometimes bypasses servers that block direct media element fetches.
+    try {
+      const resp = await fetch(url, { mode: 'cors' });
+      if (!resp.ok) throw new Error(`Fetch failed: ${resp.status}`);
+      const blob = await resp.blob();
+      const objUrl = URL.createObjectURL(blob);
+      // store object URL on element so cleanup can revoke it
+      try { (video as any).__objectURL = objUrl; } catch(e){}
+      video.src = objUrl;
+      video.load();
+      await video.play();
+      setIsLoading(false);
+      return;
+    } catch (e) {
+      console.error('Blob fallback failed:', e);
+      setError('Direct stream failed — possible CORS or network issue');
+      setIsLoading(false);
+    }
   };
 
   // Load HLS: tuned for low latency + robust error recovery
@@ -428,8 +468,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       if (video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = ch.stream_url;
         video.preload = 'auto';
-        try { video.muted = false; } catch {}
-        setIsMuted(false);
+        try { video.muted = true; } catch {}
+        setIsMuted(true);
         await video.play().catch(()=>{});
         return;
       }
@@ -445,17 +485,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     // HLS.js configuration tuned for fast start and low-latency live
     const hlsConfig = {
       enableWorker: true,
-      maxBufferLength: 25,            // keep buffer reasonably low to reduce latency
+      maxBufferLength: 25,
       maxMaxBufferLength: 45,
       maxBufferSize: 60 * 1000 * 1000,
       maxBufferHole: 0.5,
-      lowLatencyMode: true,           // enable LL-HLS support when available
-      liveSyncDuration: 3,            // target distance from live (seconds)
-      liveMaxLatencyDuration: 12,     // upper bound on latency to live edge
+      lowLatencyMode: true,
+      liveSyncDuration: 3,
+      liveMaxLatencyDuration: 12,
       startLevel: -1,
       startFragPrefetch: true,
       capLevelToPlayerSize: true,
-      // nudgeOffset and nudgeMaxRetry are helpful in some network cases
       nudgeOffset: 0.1,
       nudgeMaxRetry: 3
     };
@@ -469,8 +508,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
 
     // attempt immediate autoplay via muted trick (improves "no autoplay" on some browsers)
     video.preload = 'auto';
-    try { video.muted = false; } catch {}
-    setIsMuted(false);
+    try { video.muted = true; } catch {}
+    setIsMuted(true);
     try { await video.play().catch(()=>{}); } catch {}
 
     // HLS event handlers - populate qualities and add robust error recovery
@@ -478,72 +517,36 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       try {
         const qualities = (data.levels || []).map((l: any) => `${l.height || l.name || 'auto'}p`);
         setAvailableQualities(Array.from(new Set(['auto', ...qualities])));
-        // start loading from live edge
         hls.startLoad(-1);
-        // if we can autoplay, try; otherwise UI play will work
         video.play().catch(()=>{});
       } finally {
         setIsLoading(false);
       }
     });
 
-    // When fragments buffered, clear loading UI
     hls.on(window.Hls.Events.FRAG_BUFFERED, () => {
       setIsLoading(false);
     });
 
-    // Listen to level updated to reflect resolution changes
-    hls.on(window.Hls.Events.LEVEL_SWITCHED, () => {
-      // nothing here, but could be used to set current quality
-    });
-
-    // Error handling - aggressive recovery for network/media errors
     hls.on(window.Hls.Events.ERROR, (_: any, data: any) => {
       console.warn('HLS error event:', data);
       if (!data || !data.fatal) return;
 
       try {
-        // Try to auto-recover common fatal error types
         if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
-          // attempt to restart loading
-          try {
-            hls.startLoad();
-            setTimeout(() => { /* Let the loader settle */ }, 500);
-          } catch (e) {
-            console.warn('hls network recovery failed', e);
-            try { hls.destroy(); } catch {}
-          }
+          try { hls.startLoad(); } catch (e) { console.warn('hls network recovery failed', e); try { hls.destroy(); } catch {} }
         } else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
-          try {
-            hls.recoverMediaError();
-          } catch (e) {
-            console.warn('hls media recovery error', e);
-            try { hls.destroy(); } catch {}
-          }
+          try { hls.recoverMediaError(); } catch (e) { console.warn('hls media recovery error', e); try { hls.destroy(); } catch {} }
         } else {
-          // fallback: full reload of hls instance
-          try {
-            hls.destroy();
-            // re-create and re-attach one time
-            const newHls = new window.Hls(hlsConfig);
-            hlsRef.current = newHls;
-            newHls.loadSource(ch.stream_url);
-            newHls.attachMedia(video);
-            newHls.startLoad(-1);
-          } catch (e) {
-            console.error('hls full reload failed', e);
-            setError('Stream error occurred');
-          }
+          try { hls.destroy(); const newHls = new window.Hls(hlsConfig); hlsRef.current = newHls; newHls.loadSource(ch.stream_url); newHls.attachMedia(video); newHls.startLoad(-1); } catch (e) { console.error('hls full reload failed', e); setError('Stream error occurred'); }
         }
       } catch (e) {
         console.error('hls error handling broken', e);
       }
     });
 
-    // Keep last-progress for watchdog
     lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime || 0 };
 
-    // Start a lightweight watchdog to detect stalls (no progress for X seconds)
     if (watchdogIntervalRef.current) {
       clearInterval(watchdogIntervalRef.current);
       watchdogIntervalRef.current = null;
@@ -556,16 +559,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
           lastProgressRef.current = { time: now, currentTime: video.currentTime };
           return;
         }
-        // If no progress in >6s while playing, attempt recovery
         if (video.currentTime === prev.currentTime && now - prev.time > 6000) {
           console.warn('Watchdog: detected stall, attempting recovery');
-          // try media error recovery
           try { hls.recoverMediaError(); } catch(e){ console.warn('recoverMediaError failed', e); }
-          // if still stalled, try restarting load
           try { hls.stopLoad(); hls.startLoad(-1); } catch(e){ console.warn('hls restart failed', e); }
           lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime };
         } else {
-          // progress observed -> update
           lastProgressRef.current = { time: now, currentTime: video.currentTime };
         }
       } catch (e) {
@@ -578,7 +577,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
   const loadMPD = async (video: HTMLVideoElement, ch: Channel) => {
     if (!window.shaka) throw new Error('Shaka Player not loaded');
 
-    // Cleanup previous
     if (shakaPlayerRef.current) {
       try { shakaPlayerRef.current.destroy(); } catch(e) { console.warn('old shaka destroy', e); }
       shakaPlayerRef.current = null;
@@ -587,19 +585,18 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     const player = new window.shaka.Player(video);
     shakaPlayerRef.current = player;
 
-    // Configure Shaka for low latency + robust behavior
     player.configure({
       streaming: {
-        lowLatencyMode: true,      // enable LL-DASH/Low-latency behavior when the manifest supports it
-        bufferingGoal: 10,         // seconds - keep this moderate to reduce latency
-        rebufferingGoal: 1,        // seconds - attempt to rebuffer quickly
+        lowLatencyMode: true,
+        bufferingGoal: 10,
+        rebufferingGoal: 1,
         bufferBehind: 30,
         smallGapLimit: 0.5,
         ignoreMinBufferTime: true
       },
       abr: {
         enabled: true,
-        defaultBandwidthEstimate: 5000000, // bias initial selection toward higher BW to avoid slow startup switching
+        defaultBandwidthEstimate: 5000000,
       },
       manifest: {
         retryParameters: {
@@ -610,7 +607,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       }
     });
 
-    // Configure ClearKey if provided
     if ((ch as any).clearkey_kid && (ch as any).clearkey_key) {
       player.configure({
         drm: {
@@ -628,14 +624,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
     player.addEventListener('error', (event: any) => {
       console.error('Shaka error:', event.detail);
       setError('Playback error occurred');
-      // Attempt a soft recovery on network errors
       try {
         const severity = event.detail && event.detail.severity;
         if (severity === window.shaka.util.Error.Severity.RECOVERABLE) {
-          // try to reconfigure ABR to be more conservative
           player.configure({ abr: { enabled: true, defaultBandwidthEstimate: 1000000 } });
         } else {
-          // fatal -> try reloading manifest once
           player.unload().then(() => player.load(ch.stream_url)).catch(e => console.warn('shaka reload failed', e));
         }
       } catch(e){}
@@ -647,19 +640,17 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
       setAvailableQualities(['auto', ...qualities]);
     });
 
-    // Start load
     try {
       await player.load(ch.stream_url);
       video.preload = 'auto';
-      try { video.muted = false; } catch {}
-      setIsMuted(false);
+      try { video.muted = true; } catch {}
+      setIsMuted(true);
       await video.play().catch(()=>{});
     } catch (e) {
       console.error('Shaka load/play failed', e);
       setError('Failed to load DASH stream');
     }
 
-    // Watchdog for Shaka: watch for stalls and try to recover by reducing quality
     lastProgressRef.current = { time: Date.now(), currentTime: video.currentTime || 0 };
     if (watchdogIntervalRef.current) {
       clearInterval(watchdogIntervalRef.current);
@@ -675,7 +666,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
         }
         if (video.currentTime === prev.currentTime && now - prev.time > 6000) {
           console.warn('Watchdog (shaka): detected stall, attempting recovery');
-          // Try lowering ABR aggressiveness or selecting lower track
           try {
             const tracks = shakaPlayerRef.current.getVariantTracks().filter((t:any) => t.allowed);
             const sorted = tracks.sort((a:any,b:any)=>a.bandwidth-b.bandwidth);
@@ -684,7 +674,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ channel, onChannelChange }) =
               shakaPlayerRef.current.configure({ abr: { enabled: false } });
               shakaPlayerRef.current.selectVariantTrack(lowest, /*clearBuffer=*/ true);
             } else {
-              // fallback: reload manifest
               shakaPlayerRef.current.reload();
             }
           } catch (e) {
@@ -775,14 +764,7 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
       if (isPlaying) {
         videoRef.current.pause();
       } else {
-        // Some browsers block autoplay if not muted; attempt play and swallow errors
         if (videoRef.current.paused) {
-          // If user explicitly clicks play, treat it as a gesture — allow unmuting if desired
-          try {
-            // Only unmute on explicit click if we want that behavior; keep commented if you prefer only mousemove/touch
-            // if (videoRef.current.muted) { videoRef.current.muted = false; setIsMuted(false); }
-          } catch {}
-
           videoRef.current.play().catch(()=>{});
         }
       }
@@ -900,6 +882,8 @@ el.removeEventListener('pointermove', showControlsTemporarily as any);
         ref={videoRef}
         className="w-full h-full object-contain"
         playsInline
+        autoPlay
+        muted={isMuted}
         onClick={togglePlay}
       />
 
